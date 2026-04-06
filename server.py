@@ -41,7 +41,7 @@ MAX_REWARD = 99_999_999
 FORBIDDEN_CHARS = set("'\"\\/%")
 
 # Generic text allowlist for title and description.
-ALLOWED_TEXT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@#$&*=+]{1,256}$")
+ALLOWED_TEXT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,256}$")
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 
 # Rate limiting / throttling
