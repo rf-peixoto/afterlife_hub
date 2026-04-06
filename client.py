@@ -57,9 +57,7 @@ def banner() -> str:
     return (
         c(hr(), DIM)
         + "\n"
-        + c("AFTERLIFE SPACE CLIENT", MAGENTA)
-        + "\n"
-        + c("Secure terminal uplink", DIM)
+        + c("AFTERLIFE SPACE CLIENT", YELLOW)
         + "\n"
         + c(hr(), DIM)
     )
