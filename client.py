@@ -20,6 +20,7 @@ DEFAULT_HOST = os.environ.get("AFTERLIFE", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("AFTERLIFE", "5050"))
 SOCKET_TIMEOUT = 25
 WRAP_WIDTH = 78
+BOOT_DELAY = 0.18
 
 # ANSI colors
 RESET = "\033[0m"
@@ -33,12 +34,23 @@ RED = "\033[31m"
 WHITE = "\033[37m"
 
 
+STATUS_COLORS = {
+    "OPEN": GREEN,
+    "DONE": CYAN,
+    "CANCELLED": RED,
+}
+
+
 def c(text: str, color: str) -> str:
     return f"{color}{text}{RESET}"
 
 
-def hr(char: str = "═") -> str:
+def hr(char: str = "─") -> str:
     return char * WRAP_WIDTH
+
+
+def line(char: str = "─", color: str = DIM) -> str:
+    return c(hr(char), color)
 
 
 def clear() -> None:
@@ -46,21 +58,62 @@ def clear() -> None:
 
 
 def pause() -> None:
-    input(c("\nPress enter to continue... ", DIM))
+    input(c("\n[ press enter to continue ] ", DIM))
 
 
-def wrap(text: str) -> str:
-    return "\n".join(textwrap.wrap(text, WRAP_WIDTH)) if text else ""
+def wrap(text: str, indent: str = "") -> str:
+    if not text:
+        return ""
+    width = max(20, WRAP_WIDTH - len(indent))
+    return "\n".join(indent + part for part in textwrap.wrap(text, width=width))
 
 
 def banner() -> str:
-    return (
-        c(hr(), DIM)
-        + "\n"
-        + c("AFTERLIFE SPACE CLIENT", YELLOW)
-        + "\n"
-        + c(hr(), DIM)
+    inner = WRAP_WIDTH - 2
+    title = "A F T E R L I F E".center(inner)
+    subtitle = "private freelancer terminal".center(inner)
+    return "\n".join(
+        [
+            c("╔" + "═" * inner + "╗", CYAN),
+            c("║", CYAN) + c(title, MAGENTA + BOLD) + c("║", CYAN),
+            c("║", CYAN) + c(subtitle, DIM) + c("║", CYAN),
+            c("╚" + "═" * inner + "╝", CYAN),
+        ]
     )
+
+
+def section(title: str, subtitle: Optional[str] = None) -> None:
+    print(banner())
+    print(c(f"[ {title} ]", CYAN + BOLD))
+    if subtitle:
+        print(c(subtitle, DIM))
+    print(line())
+
+
+def prompt(text: str, color: str = MAGENTA) -> str:
+    return c(text, color)
+
+
+def status_badge(status: str) -> str:
+    normalized = str(status or "UNKNOWN").upper()
+    color = STATUS_COLORS.get(normalized, WHITE)
+    return c(f"● {normalized}", color)
+
+
+def key_value(label: str, value: str, value_color: str = WHITE) -> None:
+    print(c(f"{label:<10}: ", DIM) + c(str(value), value_color))
+
+
+def boot_sequence() -> None:
+    steps = [
+        "initializing terminal shell...",
+        "loading trusted certificate store...",
+        "preparing tls context...",
+        "establishing encrypted uplink...",
+    ]
+    for item in steps:
+        print(c(f"> {item}", DIM))
+        time.sleep(BOOT_DELAY)
 
 
 @dataclass
@@ -100,63 +153,70 @@ class RemoteClient:
 # Input helpers
 # =========================
 
-def ask(prompt: str, allow_blank: bool = False) -> str:
+def ask(prompt_text: str, allow_blank: bool = False) -> str:
     while True:
-        value = input(prompt).strip()
+        value = input(prompt(prompt_text)).strip()
         if value or allow_blank:
             return value
-        print(c("Value required.", RED))
+        print(c("input required.", RED))
 
 
-def ask_hidden(prompt: str) -> str:
+
+def ask_hidden(prompt_text: str) -> str:
     while True:
-        value = getpass.getpass(prompt).strip()
+        value = getpass.getpass(prompt(prompt_text)).strip()
         if value:
             return value
-        print(c("Value required.", RED))
+        print(c("input required.", RED))
 
 
-def ask_int(prompt: str) -> int:
+
+def ask_int(prompt_text: str) -> int:
     while True:
-        raw = input(prompt).strip()
+        raw = input(prompt(prompt_text)).strip()
         try:
             return int(raw)
         except ValueError:
-            print(c("Enter a valid number.", RED))
+            print(c("enter a valid number.", RED))
 
 
-def yes_no(prompt: str) -> bool:
+
+def yes_no(prompt_text: str) -> bool:
     while True:
-        value = input(prompt).strip().lower()
+        value = input(prompt(prompt_text)).strip().lower()
         if value in {"y", "yes"}:
             return True
         if value in {"n", "no"}:
             return False
-        print(c("Answer with yes or no.", RED))
+        print(c("answer with yes or no.", RED))
+
 
 
 def normalize_choice(value: str) -> str:
     return value.strip().lower().replace("_", " ").replace("-", " ")
 
 
-def choose(prompt: str, mapping: dict[str, str]) -> str:
+
+def choose(prompt_text: str, mapping: dict[str, str]) -> str:
     normalized = {normalize_choice(k): v for k, v in mapping.items()}
     while True:
-        value = normalize_choice(input(prompt))
+        value = normalize_choice(input(prompt(prompt_text)))
         if value in normalized:
             return normalized[value]
-        print(c("Unknown option.", RED))
+        print(c("unknown option.", RED))
+
 
 
 def show_result(response: dict[str, Any]) -> None:
+    print(line("·"))
     if response.get("ok"):
-        print(c(response.get("message", "OK"), GREEN))
+        print(c(f"[ OK ] {response.get('message', 'operation completed.')}", GREEN))
     else:
-        message = response.get("message", "Request failed.")
+        message = response.get("message", "request failed.")
         retry_after = response.get("retry_after")
         if retry_after:
-            message = f"{message} Retry after {retry_after}s."
-        print(c(message, RED))
+            message = f"{message} retry after {retry_after}s."
+        print(c(f"[ FAIL ] {message}", RED))
 
 
 # =========================
@@ -165,50 +225,59 @@ def show_result(response: dict[str, Any]) -> None:
 
 def print_jobs(jobs: list[dict[str, Any]], include_author: bool = True, completed_mode: bool = False) -> None:
     if not jobs:
-        print(c("No jobs found.", YELLOW))
+        print(c("no contracts found.", YELLOW))
         return
-    print(c(hr("─"), DIM))
+
     for job in jobs:
-        lock_mark = "[PRIVATE] " if job.get("is_private") else ""
+        lock_mark = c("[PRIVATE] ", YELLOW) if job.get("is_private") else ""
         status = str(job.get("status", "open")).upper()
-        print(c(f"#{job['id']} {lock_mark}{job['title']}", CYAN))
+        print(c(f"[ CONTRACT #{int(job['id']):04d} ]", CYAN + BOLD))
+        print(lock_mark + c(str(job["title"]), WHITE + BOLD))
+        key_value("Reward", str(job["reward"]))
+        key_value("Status", status_badge(status))
         if not completed_mode:
-            print(f"  Reward : {job['reward']}")
-            print(f"  Status : {status}")
-            print(f"  Accepts: {job.get('accept_count', 0)}")
+            key_value("Accepts", str(job.get("accept_count", 0)))
             if include_author and job.get("author_nickname"):
-                print(f"  Author : {job['author_nickname']}")
-        else:
-            print(f"  Status : {status}")
-        print(c(hr("─"), DIM))
+                key_value("Author", str(job["author_nickname"]))
+        print(line())
+
 
 
 def print_job_details(data: dict[str, Any]) -> None:
-    print(c(hr(), DIM))
-    print(c(f"JOB #{data['id']} // {data['title']}", MAGENTA))
-    print(c(hr(), DIM))
-    print(f"Reward : {data['reward']}")
-    print(f"Status : {str(data['status']).upper()}")
-    print(f"Author : {data['author_nickname']}")
-    print(f"Private: {'yes' if data['is_private'] else 'no'}")
-    print(f"Accepts: {data.get('accept_count', 0)}")
+    print(c(f"[ CONTRACT #{int(data['id']):04d} // SECURE VIEW ]", MAGENTA + BOLD))
+    print(line("═", CYAN))
+    print(c(str(data["title"]), WHITE + BOLD))
+    print(line("·"))
+    key_value("Reward", str(data["reward"]))
+    key_value("Status", status_badge(str(data["status"])))
+    key_value("Author", str(data["author_nickname"]))
+    key_value("Private", "yes" if data["is_private"] else "no", YELLOW if data["is_private"] else WHITE)
+    key_value("Accepts", str(data.get("accept_count", 0)))
     print()
+
     if data.get("description_visible"):
-        print(c("DESCRIPTION", CYAN))
-        print(wrap(data.get("description") or ""))
+        print(c("[ DESCRIPTION // DECRYPTED ]", CYAN))
+        print(wrap(data.get("description") or "", indent="  "))
     else:
-        print(c("DESCRIPTION LOCKED", YELLOW))
-        print("Use the private token to unlock this job description.")
+        print(c("[ DESCRIPTION // LOCKED ]", YELLOW + BOLD))
+        print(c("  use the private token to unlock this contract description.", DIM))
+
     print()
     workers = data.get("worker_pool")
     if workers is not None:
-        print(c("WORKER POOL", CYAN))
+        print(c("[ WORKER POOL ]", CYAN))
         if workers:
             for worker in workers:
-                marker = " *selected" if data.get("selected_worker_id") == worker["id"] else ""
-                print(f"  [{worker['id']}] {worker['nickname']} (rep {worker['reputation']}){marker}")
+                marker = c("  << SELECTED >>", GREEN) if data.get("selected_worker_id") == worker["id"] else ""
+                print(
+                    c(f"  [{worker['id']}] ", MAGENTA)
+                    + c(worker["nickname"], WHITE)
+                    + c(f"  rep={worker['reputation']}", DIM)
+                    + marker
+                )
         else:
-            print("  No workers yet.")
+            print(c("  no workers assigned yet.", DIM))
+
 
 
 def build_ssl_context(cert_path: str) -> ssl.SSLContext:
@@ -220,12 +289,17 @@ def build_ssl_context(cert_path: str) -> ssl.SSLContext:
     return context
 
 
+
 def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     clear()
-    print(banner())
-    print(c(f"Trusted certificate: {args.cert}", DIM))
-    host = ask(f"Server IP or hostname [{args.host}]: ", allow_blank=True) or args.host
-    port_raw = ask(f"Server port [{args.port}]: ", allow_blank=True) or str(args.port)
+    section("NODE LINK // TLS REQUIRED")
+    key_value("Trust PEM", args.cert, CYAN)
+    print()
+    boot_sequence()
+    print(line("·"))
+
+    host = ask(f"uplink host [{args.host}]> ", allow_blank=True) or args.host
+    port_raw = ask(f"uplink port [{args.port}]> ", allow_blank=True) or str(args.port)
     try:
         port = int(port_raw)
     except ValueError:
@@ -239,17 +313,19 @@ def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     )
     try:
         if client.ping():
-            print(c("Secure connection established.", GREEN))
+            print(c("[ LINK UP ] encrypted session established.", GREEN))
+            key_value("Remote", f"{host}:{port}", CYAN)
         else:
-            print(c("Server responded unexpectedly.", RED))
+            print(c("[ LINK ERROR ] server responded unexpectedly.", RED))
     except ssl.SSLError as exc:
-        print(c(f"TLS handshake failed: {exc}", RED))
+        print(c(f"[ TLS FAILURE ] {exc}", RED))
         sys.exit(1)
     except Exception as exc:
-        print(c(f"Connection failed: {exc}", RED))
+        print(c(f"[ CONNECTION FAILURE ] {exc}", RED))
         sys.exit(1)
     time.sleep(0.5)
     return client
+
 
 
 def auth_menu(client: RemoteClient) -> None:
@@ -261,12 +337,11 @@ def auth_menu(client: RemoteClient) -> None:
     }
     while not client.session_token:
         clear()
-        print(banner())
-        print(c("Available actions: login, register, quit", CYAN))
-        choice = choose("Action> ", choices)
+        section("AUTH // SESSION GATE", "available actions: login, register, quit")
+        choice = choose("auth@gateway> ", choices)
         if choice == "login":
-            nickname = ask("Nickname> ")
-            password = ask_hidden("Password> ")
+            nickname = ask("nickname> ")
+            password = ask_hidden("password> ")
             response = client.request({"action": "login", "nickname": nickname, "password": password})
             show_result(response)
             if response.get("ok"):
@@ -277,8 +352,8 @@ def auth_menu(client: RemoteClient) -> None:
             else:
                 pause()
         elif choice == "register":
-            nickname = ask("New nickname> ")
-            password = ask_hidden("New password> ")
+            nickname = ask("new nickname> ")
+            password = ask_hidden("new password> ")
             response = client.request({"action": "register", "nickname": nickname, "password": password})
             show_result(response)
             pause()
@@ -286,27 +361,27 @@ def auth_menu(client: RemoteClient) -> None:
             raise SystemExit(0)
 
 
+
 def view_profile(client: RemoteClient) -> None:
     clear()
-    print(banner())
+    section("PROFILE // IDENTITY NODE")
     response = client.request({"action": "profile"})
     if not response.get("ok"):
         show_result(response)
         pause()
         return
     data = response["data"]
-    print(c("PROFILE", CYAN))
-    print(c(hr("─"), DIM))
-    print(f"Nickname  : {data['nickname']}")
-    print(f"Reputation: {data['reputation']}")
-    print(c(hr("─"), DIM))
+    key_value("Nickname", data["nickname"], WHITE + BOLD)
+    key_value("Reputation", str(data["reputation"]), CYAN)
+    print(line())
     pause()
+
 
 
 def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed_mode: bool = False) -> None:
     clear()
-    print(banner())
-    print(c(f"JOB BOARD // {status.upper() if status else 'ALL'}", CYAN))
+    status_title = status.upper() if status else "ALL"
+    section(f"JOB BOARD // {status_title} CONTRACTS")
     response = client.request({"action": "list_jobs", "status": status})
     if not response.get("ok"):
         show_result(response)
@@ -317,15 +392,16 @@ def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed
     pause()
 
 
+
 def create_job_menu(client: RemoteClient) -> None:
     clear()
-    print(banner())
-    print(c("CREATE JOB", CYAN))
-    print(c("Forbidden characters in text fields: ' \" \\ / %", DIM))
-    title = ask("Title> ")
-    description = ask("Description> ")
-    reward = ask("Reward> ")
-    is_private = yes_no("Private job? [yes/no]> ")
+    section("CREATE CONTRACT // BROADCAST")
+    print(c("forbidden characters in text fields: ' \" \\ / %", DIM))
+    print(line("·"))
+    title = ask("title> ")
+    description = ask("description> ")
+    reward = ask("reward> ")
+    is_private = yes_no("private contract? [yes/no]> ")
     response = client.request(
         {
             "action": "create_job",
@@ -338,18 +414,19 @@ def create_job_menu(client: RemoteClient) -> None:
     show_result(response)
     if response.get("ok"):
         data = response.get("data", {})
-        print(c(f"Job id: {data.get('job_id')}", GREEN))
+        key_value("Contract", str(data.get("job_id")), GREEN)
         if data.get("private_token"):
-            print(c("Private token (save it carefully):", YELLOW))
+            print(c("[ PRIVATE TOKEN // STORE SECURELY ]", YELLOW + BOLD))
             print(c(data["private_token"], MAGENTA))
     pause()
 
 
+
 def job_details_menu(client: RemoteClient) -> None:
     clear()
-    print(banner())
-    job_id = ask_int("Job id> ")
-    unlock_token = ask("Unlock token (blank if none)> ", allow_blank=True)
+    section("CONTRACT DETAILS // SECURE VIEW")
+    job_id = ask_int("contract id> ")
+    unlock_token = ask("unlock token [blank if none]> ", allow_blank=True)
     response = client.request(
         {
             "action": "job_details",
@@ -365,9 +442,9 @@ def job_details_menu(client: RemoteClient) -> None:
     data = response["data"]
     while True:
         clear()
-        print(banner())
+        section("CONTRACT DETAILS // LIVE VIEW", "available actions depend on your role")
         print_job_details(data)
-        print(c(hr(), DIM))
+        print(line("═", CYAN))
         actions = {
             "accept": "accept",
             "withdraw": "withdraw",
@@ -384,8 +461,8 @@ def job_details_menu(client: RemoteClient) -> None:
                 }
             )
             visible_actions = ["accept", "withdraw", "select worker", "done", "cancelled", "reopen", "back"]
-        print(c("Available actions: " + ", ".join(visible_actions), CYAN))
-        choice = choose("Action> ", actions)
+        print(c("commands: " + ", ".join(visible_actions), CYAN))
+        choice = choose("contract@view> ", actions)
         if choice == "accept":
             resp = client.request({"action": "accept_job", "job_id": data["id"]})
             show_result(resp)
@@ -395,7 +472,7 @@ def job_details_menu(client: RemoteClient) -> None:
             show_result(resp)
             pause()
         elif choice == "select worker" and (data.get("is_author") or data.get("is_admin")):
-            worker_id = ask_int("Worker id> ")
+            worker_id = ask_int("worker id> ")
             resp = client.request({"action": "select_worker", "job_id": data["id"], "worker_id": worker_id})
             show_result(resp)
             pause()
@@ -426,31 +503,31 @@ def job_details_menu(client: RemoteClient) -> None:
         data = refresh["data"]
 
 
+
 def my_jobs_menu(client: RemoteClient) -> None:
     clear()
-    print(banner())
+    section("MY CONTRACTS // AUTHORED")
     response = client.request({"action": "my_jobs"})
     if not response.get("ok"):
         show_result(response)
         pause()
         return
-    print(c("MY AUTHORED JOBS", CYAN))
     print_jobs(response["data"]["jobs"], include_author=False)
     pause()
 
 
+
 def my_accepts_menu(client: RemoteClient) -> None:
     clear()
-    print(banner())
+    section("MY CONTRACTS // ACCEPTED + COMPLETED", "descriptions remain omitted here, including private contracts")
     response = client.request({"action": "my_accepts"})
     if not response.get("ok"):
         show_result(response)
         pause()
         return
-    print(c("MY COMPLETED / ACCEPTED VIEW", CYAN))
-    print(c("Descriptions are omitted here, including private jobs.", DIM))
     print_jobs(response["data"]["jobs"], completed_mode=True)
     pause()
+
 
 
 def main_menu(client: RemoteClient) -> None:
@@ -476,10 +553,15 @@ def main_menu(client: RemoteClient) -> None:
     }
     while True:
         clear()
-        print(banner())
-        print(c(f"Operator: {client.nickname}", GREEN))
-        print(c("Commands: open jobs, done jobs, cancelled jobs, create job, job details, my authored jobs, my accepted, profile, logout, quit", CYAN))
-        choice = choose("Command> ", choices)
+        section("MAIN GRID // OPERATOR CONSOLE")
+        key_value("Operator", client.nickname or "unknown", GREEN)
+        print(c(
+            "commands: open jobs, done jobs, cancelled jobs, create job, job details, "
+            "my authored jobs, my accepted, profile, logout, quit",
+            CYAN,
+        ))
+        print(line("·"))
+        choice = choose("afterlife@node> ", choices)
         if choice == "open jobs":
             list_jobs_menu(client, status="open")
         elif choice == "done jobs":
@@ -507,10 +589,11 @@ def main_menu(client: RemoteClient) -> None:
             raise SystemExit(0)
 
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "AFTERLIFE Space client. TLS is mandatory. Use --cert to point to the PEM certificate "
+            "AFTERLIFE client terminal. TLS is mandatory. Use --cert to point to the PEM certificate "
             "or CA bundle used to validate the server certificate."
         )
     )
@@ -532,6 +615,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
 def main() -> None:
     args = parse_args()
     client = connect_prompt(args)
@@ -544,4 +628,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(c("\nSession interrupted.", RED))
+        print(c("\n[ session interrupted ]", RED))
