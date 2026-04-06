@@ -11,6 +11,18 @@ services:
     ports:
       - "5050:5050"
 
+    environment:
+      AFTERLIFE_DB_PATH: /data/AFTERLIFE_space.db
+      AFTERLIFE_MASTER_KEY_PATH: /data/master.key
+      AFTERLIFE_LOG_PATH: /data/server.log
+      AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: admin
+      AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD:?set_a_strong_bootstrap_secret}
+      AFTERLIFE_MAX_REQUEST_LINE_BYTES: 8192
+      AFTERLIFE_MAX_JSON_DEPTH: 16
+      AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW: 10
+      AFTERLIFE_MAX_CONNECTIONS: 100
+      AFTERLIFE_MAX_WORKERS: 32
+
     volumes:
       - ./data:/data
       - ./certs:/certs:ro

@@ -15,6 +15,7 @@ import ssl
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -36,6 +37,12 @@ MIN_NICK_LEN = 3
 MAX_NICK_LEN = 24
 MIN_PASSWORD_LEN = 8
 MAX_REWARD = 99_999_999
+MAX_CONTACT_INFO_LEN = 128
+MAX_REQUEST_LINE_BYTES = int(os.environ.get("AFTERLIFE_MAX_REQUEST_LINE_BYTES", "8192"))
+MAX_JSON_DEPTH = int(os.environ.get("AFTERLIFE_MAX_JSON_DEPTH", "16"))
+MAX_PARSE_ERRORS_PER_WINDOW = int(os.environ.get("AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW", "10"))
+MAX_CONNECTIONS = int(os.environ.get("AFTERLIFE_MAX_CONNECTIONS", "100"))
+MAX_WORKERS = int(os.environ.get("AFTERLIFE_MAX_WORKERS", "32"))
 
 # Forbidden across validated text input fields requested by user.
 FORBIDDEN_CHARS = set("'\"\\/%")
@@ -43,6 +50,7 @@ FORBIDDEN_CHARS = set("'\"\\/%")
 # Generic text allowlist for title and description.
 ALLOWED_TEXT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,256}$")
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
+CONTACT_INFO_RE = re.compile(r"^[A-Za-z0-9 @._-]{1,128}$")
 
 # Rate limiting / throttling
 GLOBAL_WINDOW_SECONDS = 10
@@ -54,8 +62,8 @@ AUTH_LOCK_SECONDS = 300
 READ_TIMEOUT_SECONDS = 180
 SESSION_IDLE_SECONDS = 3600
 
-BOOTSTRAP_ADMIN_USERNAME = "admin"
-BOOTSTRAP_ADMIN_PASSWORD = "changeme"
+BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME", "admin")
+BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
 
 
 # =========================
@@ -177,6 +185,39 @@ def validate_reward(raw: str) -> Optional[str]:
     return None
 
 
+def validate_contact_info(contact_info: str) -> Optional[str]:
+    if not contact_info or len(contact_info) > MAX_CONTACT_INFO_LEN:
+        return f"Contact info must be 1-{MAX_CONTACT_INFO_LEN} characters."
+    if has_forbidden_chars(contact_info):
+        return "Contact info contains forbidden characters."
+    if not CONTACT_INFO_RE.fullmatch(contact_info):
+        return "Contact info may only contain letters, digits, spaces, and @ . - _."
+    return None
+
+
+
+
+def json_depth(value: Any, depth: int = 0) -> int:
+    if depth > MAX_JSON_DEPTH:
+        return depth
+    if isinstance(value, dict):
+        if not value:
+            return depth + 1
+        return max(json_depth(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        if not value:
+            return depth + 1
+        return max(json_depth(v, depth + 1) for v in value)
+    return depth + 1
+
+
+def ensure_request_shape(request: Any) -> Optional[str]:
+    if not isinstance(request, dict):
+        return "Request must be a JSON object."
+    if json_depth(request) > MAX_JSON_DEPTH:
+        return f"JSON nesting exceeds limit of {MAX_JSON_DEPTH}."
+    return None
+
 # =========================
 # Database
 # =========================
@@ -204,6 +245,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     nickname TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
+                    contact_info_enc TEXT NOT NULL DEFAULT '',
                     reputation INTEGER NOT NULL DEFAULT 0,
                     is_admin INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
@@ -236,25 +278,37 @@ class Database:
                 );
                 """
             )
+            self._migrate_schema(con)
+
+    def _migrate_schema(self, con: sqlite3.Connection) -> None:
+        user_columns = {row["name"] for row in con.execute("PRAGMA table_info(users)").fetchall()}
+        if "contact_info_enc" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN contact_info_enc TEXT NOT NULL DEFAULT ''")
 
     def _ensure_bootstrap_admin(self) -> None:
         with self.lock, self.conn() as con:
             row = con.execute(
                 "SELECT id FROM users WHERE nickname = ?", (BOOTSTRAP_ADMIN_USERNAME,)
             ).fetchone()
-            if row is None:
-                con.execute(
-                    "INSERT INTO users (nickname, password_hash, reputation, is_admin, created_at) VALUES (?, ?, 0, 1, ?)",
-                    (BOOTSTRAP_ADMIN_USERNAME, pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD), int(time.time())),
+            if row is not None:
+                return
+            if not BOOTSTRAP_ADMIN_PASSWORD or BOOTSTRAP_ADMIN_PASSWORD == "changeme":
+                raise RuntimeError(
+                    "Refusing to auto-provision bootstrap admin with an unsafe default password. "
+                    "Set AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD to a strong secret before starting the server."
                 )
-                log("Bootstrap admin account created.")
+            con.execute(
+                "INSERT INTO users (nickname, password_hash, reputation, is_admin, created_at) VALUES (?, ?, 0, 1, ?)",
+                (BOOTSTRAP_ADMIN_USERNAME, pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD), int(time.time())),
+            )
+            log("Bootstrap admin account created from operator-supplied secret.")
 
-    def create_user(self, nickname: str, password: str) -> tuple[bool, str]:
+    def create_user(self, nickname: str, password: str, contact_info: str) -> tuple[bool, str]:
         with self.lock, self.conn() as con:
             try:
                 con.execute(
-                    "INSERT INTO users (nickname, password_hash, reputation, is_admin, created_at) VALUES (?, ?, 0, 0, ?)",
-                    (nickname, pbkdf2_hash(password), int(time.time())),
+                    "INSERT INTO users (nickname, password_hash, contact_info_enc, reputation, is_admin, created_at) VALUES (?, ?, ?, 0, 0, ?)",
+                    (nickname, pbkdf2_hash(password), crypto.enc(contact_info), int(time.time())),
                 )
                 return True, "User created."
             except sqlite3.IntegrityError:
@@ -263,7 +317,7 @@ class Database:
     def authenticate(self, nickname: str, password: str) -> Optional[sqlite3.Row]:
         with self.lock, self.conn() as con:
             row = con.execute(
-                "SELECT id, nickname, password_hash, reputation, is_admin, created_at FROM users WHERE nickname = ?",
+                "SELECT id, nickname, password_hash, contact_info_enc, reputation, is_admin, created_at FROM users WHERE nickname = ?",
                 (nickname,),
             ).fetchone()
             if row and pbkdf2_verify(password, row["password_hash"]):
@@ -273,7 +327,7 @@ class Database:
     def get_user(self, user_id: int) -> Optional[sqlite3.Row]:
         with self.lock, self.conn() as con:
             return con.execute(
-                "SELECT id, nickname, reputation, is_admin, created_at FROM users WHERE id = ?",
+                "SELECT id, nickname, contact_info_enc, reputation, is_admin, created_at FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
 
@@ -382,10 +436,18 @@ class Database:
 
             if is_author or is_admin:
                 workers = con.execute(
-                    "SELECT u.id, u.nickname, u.reputation FROM job_accepts a JOIN users u ON u.id = a.user_id WHERE a.job_id = ? ORDER BY a.created_at ASC",
+                    "SELECT u.id, u.nickname, u.contact_info_enc, u.reputation FROM job_accepts a JOIN users u ON u.id = a.user_id WHERE a.job_id = ? ORDER BY a.created_at ASC",
                     (job_id,),
                 ).fetchall()
-                data["worker_pool"] = [dict(w) for w in workers]
+                data["worker_pool"] = [
+                    {
+                        "id": int(w["id"]),
+                        "nickname": str(w["nickname"]),
+                        "contact_info": crypto.dec(w["contact_info_enc"]),
+                        "reputation": int(w["reputation"]),
+                    }
+                    for w in workers
+                ]
             else:
                 data["worker_pool"] = None
 
@@ -505,7 +567,7 @@ class Database:
         }
 
 
-db = Database(DB_PATH)
+db: Database
 
 
 # =========================
@@ -615,6 +677,7 @@ class LoginThrottle:
 sessions = SessionStore()
 global_limiter = SlidingWindowLimiter(GLOBAL_WINDOW_SECONDS, GLOBAL_MAX_REQUESTS_PER_WINDOW)
 login_throttle = LoginThrottle()
+parse_error_limiter = SlidingWindowLimiter(GLOBAL_WINDOW_SECONDS, MAX_PARSE_ERRORS_PER_WINDOW)
 
 
 # =========================
@@ -664,9 +727,9 @@ def require_session(request: dict[str, Any]) -> tuple[Optional[Session], Optiona
 
 
 def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
-    allowed, retry = global_limiter.allow(ip)
-    if not allowed:
-        return err("Too many requests. Slow down.", "rate_limited", retry)
+    shape_problem = ensure_request_shape(request)
+    if shape_problem:
+        return err(shape_problem, "bad_request")
 
     action = request.get("action")
     if not isinstance(action, str):
@@ -680,10 +743,11 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
     if action == "register":
         nickname = str(request.get("nickname", "")).strip()
         password = str(request.get("password", ""))
-        problem = validate_nickname(nickname) or validate_password(password)
+        contact_info = str(request.get("contact_info", "")).strip()
+        problem = validate_nickname(nickname) or validate_password(password) or validate_contact_info(contact_info)
         if problem:
             return err(problem, "validation_error")
-        success, message = db.create_user(nickname, password)
+        success, message = db.create_user(nickname, password, contact_info)
         return ok(message=message) if success else err(message, "register_failed")
 
     if action == "login":
@@ -722,6 +786,7 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         return ok(
             {
                 "nickname": user["nickname"],
+                "contact_info": crypto.dec(user["contact_info_enc"]),
                 "reputation": user["reputation"],
                 "created_at": user["created_at"],
             }
@@ -820,28 +885,53 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
     return err("Unknown action.", "unknown_action")
 
 
-class ClientHandler(threading.Thread):
-    def __init__(self, sock: socket.socket, addr: tuple[str, int]) -> None:
-        super().__init__(daemon=True)
+class ClientHandler:
+    def __init__(self, sock: socket.socket, addr: tuple[str, int], active_connections: set[str], active_lock: threading.Lock) -> None:
         self.sock = sock
         self.addr = addr
+        self.active_connections = active_connections
+        self.active_lock = active_lock
 
     def run(self) -> None:
         ip, port = self.addr[0], self.addr[1]
-        log(f"Client connected: {ip}:{port}")
+        peer = f"{ip}:{port}"
+        log(f"Client connected: {peer}")
         self.sock.settimeout(READ_TIMEOUT_SECONDS)
         file = self.sock.makefile("rwb")
         try:
             while True:
-                line = file.readline()
+                allowed, retry = global_limiter.allow(ip)
+                if not allowed:
+                    response = err("Too many requests. Slow down.", "rate_limited", retry)
+                    file.write((json.dumps(response) + "\n").encode("utf-8"))
+                    file.flush()
+                    break
+
+                line = file.readline(MAX_REQUEST_LINE_BYTES + 1)
                 if not line:
+                    break
+                if len(line) > MAX_REQUEST_LINE_BYTES and not line.endswith(b"\n"):
+                    response = err(f"Request line exceeds {MAX_REQUEST_LINE_BYTES} bytes.", "request_too_large")
+                    file.write((json.dumps(response) + "\n").encode("utf-8"))
+                    file.flush()
+                    break
+                if len(line) > MAX_REQUEST_LINE_BYTES:
+                    response = err(f"Request line exceeds {MAX_REQUEST_LINE_BYTES} bytes.", "request_too_large")
+                    file.write((json.dumps(response) + "\n").encode("utf-8"))
+                    file.flush()
                     break
                 try:
                     request = json.loads(line.decode("utf-8"))
                 except Exception:
-                    response = err("Invalid JSON.", "bad_json")
-                else:
-                    response = handle_request(request, ip)
+                    allowed_parse, retry_parse = parse_error_limiter.allow(ip)
+                    response = err("Invalid JSON.", "bad_json", None if allowed_parse else retry_parse)
+                    file.write((json.dumps(response) + "\n").encode("utf-8"))
+                    file.flush()
+                    if not allowed_parse:
+                        break
+                    continue
+
+                response = handle_request(request, ip)
                 file.write((json.dumps(response) + "\n").encode("utf-8"))
                 file.flush()
         except (ConnectionError, TimeoutError, OSError):
@@ -855,7 +945,9 @@ class ClientHandler(threading.Thread):
                 self.sock.close()
             except Exception:
                 pass
-            log(f"Client disconnected: {ip}:{port}")
+            with self.active_lock:
+                self.active_connections.discard(peer)
+            log(f"Client disconnected: {peer}")
 
 
 class Server:
@@ -865,12 +957,15 @@ class Server:
         self.ssl_context = ssl_context
         self.sock: Optional[socket.socket] = None
         self.stop_event = threading.Event()
+        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="afterlife-client")
+        self.active_connections: set[str] = set()
+        self.active_lock = threading.Lock()
 
     def serve(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((self.host, self.port))
-            sock.listen(50)
+            sock.listen(MAX_CONNECTIONS)
             self.sock = sock
             log(f"AFTERLIFE Space TLS server listening on {self.host}:{self.port}")
             while not self.stop_event.is_set():
@@ -878,17 +973,29 @@ class Server:
                     client, addr = sock.accept()
                 except OSError:
                     break
+                peer = f"{addr[0]}:{addr[1]}" if addr else "unknown"
+                with self.active_lock:
+                    if len(self.active_connections) >= MAX_CONNECTIONS:
+                        log(f"Connection rejected due to capacity limit: {peer}")
+                        try:
+                            client.close()
+                        except OSError:
+                            pass
+                        continue
+                    self.active_connections.add(peer)
                 try:
                     tls_client = self.ssl_context.wrap_socket(client, server_side=True)
                 except ssl.SSLError as exc:
-                    peer = f"{addr[0]}:{addr[1]}" if addr else "unknown"
                     log(f"TLS handshake failed for {peer}: {exc}")
+                    with self.active_lock:
+                        self.active_connections.discard(peer)
                     try:
                         client.close()
                     except OSError:
                         pass
                     continue
-                ClientHandler(tls_client, addr).start()
+                handler = ClientHandler(tls_client, addr, self.active_connections, self.active_lock)
+                self.executor.submit(handler.run)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -897,6 +1004,7 @@ class Server:
                 self.sock.close()
             except OSError:
                 pass
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 def build_server_ssl_context(certfile: str, keyfile: Optional[str]) -> ssl.SSLContext:
@@ -933,6 +1041,12 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    try:
+        db = Database(DB_PATH)
+    except Exception as exc:
+        log(f"Unable to initialize database/bootstrap state: {exc}")
+        raise SystemExit(1)
+
     try:
         ssl_context = build_server_ssl_context(args.cert, args.key)
     except Exception as exc:

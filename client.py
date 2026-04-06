@@ -16,9 +16,10 @@ from typing import Any, Optional
 # =========================
 # Configuration
 # =========================
-DEFAULT_HOST = os.environ.get("AFTERLIFE", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("AFTERLIFE", "5050"))
+DEFAULT_HOST = os.environ.get("AFTERLIFE_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.environ.get("AFTERLIFE_PORT", "5050"))
 SOCKET_TIMEOUT = 25
+MAX_RESPONSE_BYTES = int(os.environ.get("AFTERLIFE_MAX_RESPONSE_BYTES", "1048576"))
 WRAP_WIDTH = 78
 BOOT_DELAY = 0.18
 
@@ -140,6 +141,8 @@ class RemoteClient:
                     if not data:
                         break
                     chunks += data
+                    if len(chunks) > MAX_RESPONSE_BYTES:
+                        raise RuntimeError(f"Server response exceeded {MAX_RESPONSE_BYTES} bytes.")
         if not chunks:
             raise RuntimeError("No response from server.")
         return json.loads(chunks.decode("utf-8").strip())
@@ -275,6 +278,7 @@ def print_job_details(data: dict[str, Any]) -> None:
                     + c(f"  rep={worker['reputation']}", DIM)
                     + marker
                 )
+                print(c("      contact: ", DIM) + c(str(worker.get("contact_info", "")), CYAN))
         else:
             print(c("  no workers assigned yet.", DIM))
 
@@ -354,7 +358,8 @@ def auth_menu(client: RemoteClient) -> None:
         elif choice == "register":
             nickname = ask("new nickname> ")
             password = ask_hidden("new password> ")
-            response = client.request({"action": "register", "nickname": nickname, "password": password})
+            contact_info = ask("contact info> ")
+            response = client.request({"action": "register", "nickname": nickname, "password": password, "contact_info": contact_info})
             show_result(response)
             pause()
         elif choice == "quit":
@@ -372,6 +377,7 @@ def view_profile(client: RemoteClient) -> None:
         return
     data = response["data"]
     key_value("Nickname", data["nickname"], WHITE + BOLD)
+    key_value("Contact", data.get("contact_info", ""), CYAN)
     key_value("Reputation", str(data["reputation"]), CYAN)
     print(line())
     pause()

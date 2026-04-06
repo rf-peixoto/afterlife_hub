@@ -1,10 +1,10 @@
 # AFTERLIFE
 
-AFTERLIFE is a private hub for freelancers accessible directly via terminal. Post your request in the public journal or, for more sensitive tasks, in the private journal. Leave your contact information in the description. Complete a job, get rep.
+AFTERLIFE is a private hub for freelancers accessible directly via terminal. Post your request in the public journal or, for more sensitive tasks, in the private journal. Users must register with contact information, and job authors can see accepted users plus their stored contact info in the worker pool.
 
 This package contains two applications:
 
-- `server.py` - the remote job node that stores data, enforces validation, rate limiting, login throttling, access control, encrypted storage, and mandatory TLS transport.
+- `server.py` - the remote job node that stores data, enforces validation, rate limiting, login throttling, connection caps, encrypted field storage, request-size guards, and mandatory TLS transport.
 - `client.py` - the terminal UX application that connects to the server over TLS and provides the interactive interface.
 
 ## Important design notes
@@ -12,25 +12,33 @@ This package contains two applications:
 - This is a raw JSON-line protocol server over TLS.
 - Sensitive user-generated fields are encrypted at rest using Fernet (`cryptography`).
 - This is **not** full-database encryption like SQLCipher. Table structure and some metadata remain visible.
+- The Fernet master key should be stored outside the main database path, ideally on a separate protected mount or external secret store. If disk theft or backup exposure is in scope, whole-database encryption is the better design.
 - Transport is no longer plaintext. The server will not start without a certificate, and the client refuses insecure connections.
 
-## Generate your Certificates:
+## Generate certificates
 
-`openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -nodes -subj "/CN=YOUR_SERVER_IP"`
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -nodes -subj "/CN=YOUR_SERVER_IP"
+```
 
 ## Features included
 
 - register / login / logout
+- mandatory `contact_info` during registration
 - strict access controls
 - open / done / cancelled jobs
 - public and private jobs
 - private job token auto-generated with `secrets.token_urlsafe(16)`
 - selected worker logic
 - reputation increments only when a selected worker is credited on a `done` job
-- worker pool visible only to author or admin
+- worker pool visible only to author or admin, including contact info for accepted users
 - completed/accepted lists omit descriptions
 - global per-IP rate limiting
+- invalid-traffic throttling for malformed JSON
 - login throttling per `IP + nickname`
+- request line length limit
+- client-side response size limit
+- bounded concurrency with connection caps and a worker pool
 - mandatory TLS on every request
 
 ## Validation rules
@@ -47,6 +55,10 @@ Nickname:
 - 3 to 24 chars
 - letters, digits, underscore only
 
+Contact info:
+- 1 to 128 chars
+- letters, digits, spaces, `@`, `.`, `-`, `_` only
+
 Title:
 - 1 to 32 chars
 - restricted printable subset
@@ -61,12 +73,16 @@ Reward:
 
 ## Bootstrap admin
 
-A bootstrap admin is created automatically on first run:
+The server no longer creates a bootstrap admin with a built-in default password.
 
-- username: `admin`
-- password: `changeme`
+On first run, if the bootstrap admin account does not exist, you **must** provide an operator secret through environment variables:
 
-Change or delete it before serious use.
+```bash
+export AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=admin
+export AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD='replace_this_with_a_real_secret'
+```
+
+The server refuses to start if the bootstrap account would otherwise be auto-provisioned with an unsafe default.
 
 ## TLS usage
 
@@ -111,7 +127,8 @@ python3 -m pip install -r requirements.txt
 ### 2. Start the server
 
 ```bash
-./run_server.sh --host 0.0.0.0 --port 5050
+export AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD='replace_this_with_a_real_secret'
+python3 server.py --host 0.0.0.0 --port 5050 --cert server.crt --key server.key
 ```
 
 Default bind:
@@ -125,11 +142,16 @@ You can still override defaults with environment variables:
 AFTERLIFE_HOST=0.0.0.0 AFTERLIFE_PORT=6000 python3 server.py --cert server.pem
 ```
 
-Other optional environment variables:
+Other useful environment variables:
 
 - `AFTERLIFE_DB_PATH`
 - `AFTERLIFE_MASTER_KEY_PATH`
 - `AFTERLIFE_LOG_PATH`
+- `AFTERLIFE_MAX_REQUEST_LINE_BYTES`
+- `AFTERLIFE_MAX_JSON_DEPTH`
+- `AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW`
+- `AFTERLIFE_MAX_CONNECTIONS`
+- `AFTERLIFE_MAX_WORKERS`
 
 ## Help output
 
@@ -169,14 +191,15 @@ Possible actions:
 - `select_worker`
 - `set_status`
 
-## TODO
+## Remaining security notes
 
-Stuff that need to be fixed:
+Still relevant gaps and trade-offs:
 
 - no MFA
 - no message-level signing beyond TLS
 - no moderation tooling beyond admin privileges
 - certificate lifecycle is still an operational responsibility of the admin
+- database field encryption is not a substitute for full-database encryption if the threat model includes disk or backup compromise
 
 ## Files
 
@@ -184,3 +207,5 @@ Stuff that need to be fixed:
 - `client.py`
 - `requirements.txt`
 - `README.md`
+- `Dockerfile`
+- `docker-compose.yml`
