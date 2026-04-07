@@ -1,106 +1,116 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================
-# Configuration
-# =========================
-CERT_DIR="./certs"
-ENV_FILE="./.env"
-COMPOSE_FILE="./docker-compose.yml"
+# ==========================================
+# AFTERLIFE secure deployment bootstrap
+# ==========================================
 
+CERT_DIR="./certs"
+DATA_DIR="./data"
+ENV_FILE="./.env"
 DEFAULT_PORT="2077"
 
-# =========================
-# Colors
-# =========================
 GREEN="\033[1;32m"
 RED="\033[1;31m"
 CYAN="\033[1;36m"
 YELLOW="\033[1;33m"
 RESET="\033[0m"
 
-echo -e "${CYAN}"
-echo "========================================"
-echo "         AFTERLIFE DEPLOYMENT"
-echo "========================================"
-echo -e "${RESET}"
+banner() {
+    echo -e "${CYAN}"
+    echo "========================================"
+    echo "         AFTERLIFE DEPLOYMENT"
+    echo "========================================"
+    echo -e "${RESET}"
+}
 
-# =========================
-# Dependency checks
-# =========================
-for cmd in docker docker-compose openssl; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo -e "${RED}[ERROR] Missing dependency: $cmd${RESET}"
+check_dependencies() {
+    for cmd in docker docker-compose openssl; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo -e "${RED}[ERROR] Missing dependency: $cmd${RESET}"
+            exit 1
+        fi
+    done
+}
+
+prompt_inputs() {
+    read -rp "Admin username [admin]: " ADMIN_USER
+    ADMIN_USER="${ADMIN_USER:-admin}"
+
+    read -rsp "Admin password: " ADMIN_PASS
+    echo
+
+    read -rp "Exposed port [$DEFAULT_PORT]: " PORT
+    PORT="${PORT:-$DEFAULT_PORT}"
+
+    if [[ -z "$ADMIN_PASS" ]]; then
+        echo -e "${RED}[ERROR] Password cannot be empty.${RESET}"
         exit 1
     fi
-done
 
-# =========================
-# User input
-# =========================
-read -rp "Admin username: " ADMIN_USER
-read -rsp "Admin password: " ADMIN_PASS
-echo
+    if [[ ${#ADMIN_PASS} -lt 12 ]]; then
+        echo -e "${RED}[ERROR] Password must have at least 12 characters.${RESET}"
+        exit 1
+    fi
+}
 
-read -rp "Exposed port [$DEFAULT_PORT]: " PORT
-PORT="${PORT:-$DEFAULT_PORT}"
+prepare_folders() {
+    mkdir -p "$CERT_DIR"
+    mkdir -p "$DATA_DIR"
+}
 
-# =========================
-# Input validation
-# =========================
-if [[ -z "$ADMIN_USER" || -z "$ADMIN_PASS" ]]; then
-    echo -e "${RED}[ERROR] Username and password cannot be empty.${RESET}"
-    exit 1
-fi
+generate_certificates() {
+    echo -e "${YELLOW}[+] Generating SSL certificate...${RESET}"
 
-# =========================
-# Create folders
-# =========================
-mkdir -p "$CERT_DIR"
+    openssl req -x509 -newkey rsa:4096 \
+        -nodes \
+        -keyout "$CERT_DIR/server.key" \
+        -out "$CERT_DIR/server.crt" \
+        -sha256 \
+        -days 365 \
+        -subj "/C=BR/ST=SaoPaulo/L=SaoPaulo/O=Afterlife/CN=localhost"
 
-# =========================
-# Generate certificate
-# =========================
-echo -e "${YELLOW}[+] Generating SSL certificate...${RESET}"
+    chmod 600 "$CERT_DIR/server.key"
+    chmod 644 "$CERT_DIR/server.crt"
+}
 
-openssl req -x509 -newkey rsa:4096 \
-    -keyout "$CERT_DIR/server.key" \
-    -out "$CERT_DIR/server.crt" \
-    -sha256
+write_env() {
+    echo -e "${YELLOW}[+] Writing environment file...${RESET}"
 
-chmod 600 "$CERT_DIR/server.key"
-chmod 644 "$CERT_DIR/server.crt"
-
-# =========================
-# Create environment file
-# =========================
-echo -e "${YELLOW}[+] Writing environment configuration...${RESET}"
-
-cat > "$ENV_FILE" <<EOF
-ADMIN_USERNAME=${ADMIN_USER}
-ADMIN_PASSWORD=${ADMIN_PASS}
-SERVER_PORT=${PORT}
-CERT_FILE=/app/certs/server.crt
-KEY_FILE=/app/certs/server.key
+    cat > "$ENV_FILE" <<EOF
+AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=${ADMIN_USER}
+AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD=${ADMIN_PASS}
+AFTERLIFE_EXPOSE_PORT=${PORT}
 EOF
 
-chmod 600 "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+}
 
-# =========================
-# Start docker
-# =========================
-echo -e "${YELLOW}[+] Starting containers...${RESET}"
+start_stack() {
+    echo -e "${YELLOW}[+] Starting Docker containers...${RESET}"
+    docker-compose --env-file "$ENV_FILE" up -d --build
+}
 
-docker-compose --env-file "$ENV_FILE" up -d --build
+success() {
+    echo -e "${GREEN}"
+    echo "========================================"
+    echo "AFTERLIFE IS RUNNING"
+    echo "========================================"
+    echo "URL: https://127.0.0.1:${PORT}"
+    echo "Cert: ${CERT_DIR}/server.crt"
+    echo "Key : ${CERT_DIR}/server.key"
+    echo -e "${RESET}"
+}
 
-# =========================
-# Success
-# =========================
-echo -e "${GREEN}"
-echo "========================================"
-echo "AFTERLIFE IS RUNNING"
-echo "========================================"
-echo "URL: https://0.0.0.0:${PORT}"
-echo "Certificate: ${CERT_DIR}/server.crt"
-echo "Key: ${CERT_DIR}/server.key"
-echo -e "${RESET}"
+main() {
+    banner
+    check_dependencies
+    prompt_inputs
+    prepare_folders
+    generate_certificates
+    write_env
+    start_stack
+    success
+}
+
+main
