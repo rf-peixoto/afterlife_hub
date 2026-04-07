@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${AFTERLIFE_EXPOSE_PORT:-2077}:5050"
+      - "${AFTERLIFE_EXPOSE_PORT:-2077}:2077"
 
     volumes:
       - ./certs:/app/certs
