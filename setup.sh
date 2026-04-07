@@ -8,7 +8,7 @@ CERT_DIR="./certs"
 ENV_FILE="./.env"
 COMPOSE_FILE="./docker-compose.yml"
 
-DEFAULT_PORT="1337"
+DEFAULT_PORT="2077"
 
 # =========================
 # Colors
