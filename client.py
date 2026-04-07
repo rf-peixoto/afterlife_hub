@@ -17,7 +17,7 @@ from typing import Any, Optional
 # Configuration
 # =========================
 DEFAULT_HOST = os.environ.get("AFTERLIFE_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("AFTERLIFE_PORT", "5050"))
+DEFAULT_PORT = int(os.environ.get("AFTERLIFE_PORT", "2077"))
 SOCKET_TIMEOUT = 25
 MAX_RESPONSE_BYTES = int(os.environ.get("AFTERLIFE_MAX_RESPONSE_BYTES", "1048576"))
 WRAP_WIDTH = 78
