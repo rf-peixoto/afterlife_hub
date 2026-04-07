@@ -26,7 +26,7 @@ from cryptography.fernet import Fernet, InvalidToken
 # Configuration
 # =========================
 HOST = os.environ.get("AFTERLIFE_HOST", "0.0.0.0")
-PORT = int(os.environ.get("AFTERLIFE_PORT", "5050"))
+PORT = int(os.environ.get("AFTERLIFE_PORT", "2077"))
 DB_PATH = Path(os.environ.get("AFTERLIFE_DB_PATH", "./AFTERLIFE_space.db"))
 MASTER_KEY_PATH = Path(os.environ.get("AFTERLIFE_MASTER_KEY_PATH", "./master.key"))
 LOG_PATH = Path(os.environ.get("AFTERLIFE_LOG_PATH", "./server.log"))
