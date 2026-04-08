@@ -1,160 +1,91 @@
-# AFTERLIFE
+# AFTERLIFE Hub
 
-AFTERLIFE is a terminal-first freelancer hub with a TLS client/server split.
+AFTERLIFE Hub is a minimalist remote freelancer platform with a cyberpunk terminal-style interface.
 
-This repository contains:
+It is composed of two parts:
 
-- `server.py`: the hardened remote node.
-- `client.py`: the terminal interface that connects to the server over TLS.
-- `setup.sh`: Docker bootstrap that generates a local CA, signs the server certificate, writes `.env`, and starts the stack.
+- **server** → hosts the application, database, users, and jobs
+- **client** → connects remotely to the server so users can log in, post jobs, and manage their accounts
 
-## Current moderation/admin model
+The platform includes:
 
-The admin account can now:
+- user registration and login
+- mandatory bootstrap admin account
+- job posting and browsing
+- private jobs with controlled visibility
+- admin moderation features
+  - ban users
+  - delete any job
+- input validation and basic rate limiting
+- terminal-first UX
 
-- delete any job from the job details view;
-- ban any non-admin user permanently from the main menu;
-- force banned users out of existing sessions.
+---
 
-Behavior after a ban:
+## Quick start
 
-- the banned user cannot log in again;
-- existing sessions are invalidated;
-- open job acceptances from that user are removed;
-- any open job where that user was selected is reset to no selected worker;
-- historical jobs created by that user remain visible, but the author name is shown as `[banned] username`.
-
-## Security model
-
-The current version enforces these controls:
-
-- mandatory TLS for all transport;
-- operator-supplied bootstrap admin secret;
-- encrypted storage for sensitive text fields with Fernet;
-- per-IP request throttling;
-- login throttling per `IP + nickname`;
-- request-size and JSON-depth guards;
-- bounded concurrency;
-- strict input validation with allowlists;
-- refusal of malformed values instead of attempting to sanitize them.
-
-## Validation rules
-
-Forbidden characters in validated text fields:
-
-- `'`
-- `"`
-- `\`
-- `/`
-- `%`
-
-Rules:
-
-- nickname: `^[A-Za-z0-9_]{3,24}$`
-- contact info: letters, digits, spaces, `@`, `.`, `-`, `_`, max 128
-- title: restricted printable subset, max 32
-- description: restricted printable subset, max 256
-- reward: digits only, from 1 to 99999999
-
-If a value does not match the expected format, the server rejects it.
-
-## Quick Docker deployment
-
-Run:
+Run the setup script:
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
 ```
 
-The script will ask for:
+The script will:
 
-- admin username;
-- admin password;
-- public hostname or IP to place in the server certificate SAN;
-- exposed port.
+- install Python dependencies
+- ask for the **admin username and password**
+- create/update the mandatory admin account
+- start the server
 
-It then generates:
+---
 
-- `certs/ca.crt` → give this to clients as the trust anchor;
-- `certs/server.crt` → server certificate;
-- `certs/server.key` → server private key.
+## Running manually
 
-Client example after the stack is up:
+### Start server
 
 ```bash
-python3 client.py --host YOUR_SERVER_NAME_OR_IP --port 2077 --cert certs/ca.crt
+python3 server.py
 ```
 
-If the client connects by IP but the certificate was issued to a DNS name, pass the DNS name with `--server-name`.
-
-## Manual local run
-
-Install dependencies:
+### Start client
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 client.py
 ```
 
-Generate a CA and a server certificate signed by it, or use your own PKI.
+The client will ask for:
 
-Start the server:
+- server IP
+- port
 
-```bash
-export AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=admin
-export AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD='replace_with_a_real_secret'
-python3 server.py --host 0.0.0.0 --port 2077 --cert server.crt --key server.key
-```
+Then users can log in normally.
 
-Start the client:
+---
 
-```bash
-python3 client.py --host 127.0.0.1 --port 2077 --cert ca.crt
-```
+## Default workflow
 
-## CLI help
+1. Run `setup.sh` on the server
+2. Create the admin credentials during setup
+3. Start `client.py` from another machine
+4. Connect to the server IP and port
+5. Log in with the admin account
 
-```bash
-python3 server.py --help
-python3 client.py --help
-```
+---
 
-## Protocol actions
+## Admin capabilities
 
-Current actions include:
+The admin account can:
 
-- `ping`
-- `register`
-- `login`
-- `logout`
-- `profile`
-- `list_jobs`
-- `my_jobs`
-- `my_accepts`
-- `create_job`
-- `job_details`
-- `accept_job`
-- `withdraw_job`
-- `select_worker`
-- `set_status`
-- `delete_job` (admin)
-- `ban_user` (admin)
+- ban users
+- delete any job
+- manage platform moderation
 
-## Docker notes
+These commands are available automatically after logging in as admin.
 
-`docker-compose.yml` exposes the server on port `2077` inside the container and maps it to `${AFTERLIFE_EXPOSE_PORT}` on the host.
+---
 
-The mounted paths are:
+## Notes
 
-- `./certs` → `/app/certs`
-- `./data` → `/app/data`
+This version intentionally runs **without TLS/SSL** to keep deployment simple while the platform is under active development.
 
-## Remaining trade-offs
-
-This is improved, but not magically complete. Relevant limits still include:
-
-- no MFA;
-- no full-database encryption like SQLCipher;
-- no audit log integrity/signing;
-- no account recovery workflow;
-- certificate lifecycle and revocation remain operational tasks.
+Do not expose it to the public internet without adding transport security and firewall rules.
