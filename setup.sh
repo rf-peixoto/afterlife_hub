@@ -48,6 +48,7 @@ compose_cmd() {
 check_dependencies() {
     command -v docker >/dev/null 2>&1 || fail "docker is required."
     command -v openssl >/dev/null 2>&1 || fail "openssl is required."
+    command -v python3 >/dev/null 2>&1 || fail "python3 is required."
 }
 
 validate_port() {
@@ -68,7 +69,35 @@ validate_password() {
 validate_server_name() {
     local name="$1"
     [[ -n "$name" ]] || fail "server name/IP cannot be empty."
-    [[ "$name" != *"'"* && "$name" != *'"'* && "$name" != *"\\"* && "$name" != *"/"* && "$name" != *"%"* ]] || fail "server name/IP contains forbidden characters."
+    [[ "$name" != *"'"* && "$name" != *'"'* && "$name" != *"\\"* && "$name" != *"/"* && "$name" != *"%"* && "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] || fail "server name/IP contains forbidden characters."
+}
+
+classify_server_name() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import re
+import sys
+value = sys.argv[1].strip()
+try:
+    ipaddress.ip_address(value)
+    print("ip")
+    raise SystemExit(0)
+except ValueError:
+    pass
+if len(value) > 253:
+    print("invalid")
+    raise SystemExit(0)
+label_re = re.compile(r'^[A-Za-z0-9-]{1,63}$')
+labels = value.split('.')
+if len(labels) < 2:
+    print("invalid")
+    raise SystemExit(0)
+for label in labels:
+    if not label or label.startswith('-') or label.endswith('-') or not label_re.fullmatch(label):
+        print("invalid")
+        raise SystemExit(0)
+print("dns")
+PY
 }
 
 prompt_inputs() {
@@ -83,6 +112,9 @@ prompt_inputs() {
     read -rp "Public hostname or IP for the server certificate SAN: " SERVER_NAME
     validate_server_name "$SERVER_NAME"
 
+    SERVER_NAME_TYPE="$(classify_server_name "$SERVER_NAME")"
+    [[ "$SERVER_NAME_TYPE" != "invalid" ]] || fail "server name must be a valid public DNS name or IP address."
+
     read -rp "Exposed port [${DEFAULT_PORT}]: " EXPOSE_PORT
     EXPOSE_PORT="${EXPOSE_PORT:-$DEFAULT_PORT}"
     validate_port "$EXPOSE_PORT"
@@ -93,12 +125,34 @@ prepare_folders() {
     chmod 700 "$CERT_DIR" "$DATA_DIR" || true
 }
 
-write_openssl_config() {
-    local san_line
-    if [[ "$SERVER_NAME" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || [[ "$SERVER_NAME" == *:* ]]; then
-        san_line="IP.1 = ${SERVER_NAME}"
+write_ca_config() {
+    cat > "$CERT_DIR/openssl-ca.cnf" <<'CFG'
+[ req ]
+default_bits = 4096
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_ca
+
+[ dn ]
+CN = AFTERLIFE Local CA
+O = AFTERLIFE
+OU = Local Certificate Authority
+
+[ v3_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+CFG
+}
+
+write_server_config() {
+    local alt_lines=""
+    if [[ "$SERVER_NAME_TYPE" == "ip" ]]; then
+        alt_lines="IP.1 = ${SERVER_NAME}"
     else
-        san_line="DNS.1 = ${SERVER_NAME}"
+        alt_lines="DNS.1 = ${SERVER_NAME}"
     fi
 
     cat > "$CERT_DIR/openssl-server.cnf" <<CFG
@@ -116,32 +170,52 @@ OU = Secure Deployment
 
 [ req_ext ]
 subjectAltName = @alt_names
-extendedKeyUsage = serverAuth
+basicConstraints = critical, CA:false
 keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = critical, serverAuth
+subjectKeyIdentifier = hash
 
 [ alt_names ]
-${san_line}
+${alt_lines}
 CFG
+}
+
+verify_server_certificate() {
+    local expected=""
+    if [[ "$SERVER_NAME_TYPE" == "ip" ]]; then
+        expected="IP Address:${SERVER_NAME}"
+    else
+        expected="DNS:${SERVER_NAME}"
+    fi
+
+    if ! openssl x509 -in "$CERT_DIR/server.crt" -noout -text | grep -F "$expected" >/dev/null 2>&1; then
+        fail "generated server certificate does not contain the expected SAN entry: ${expected}"
+    fi
 }
 
 generate_certificates() {
     info "Generating local CA and server certificate..."
-    write_openssl_config
+    write_ca_config
+    write_server_config
 
     openssl genrsa -out "$CERT_DIR/ca.key" 4096 >/dev/null 2>&1
     openssl req -x509 -new -nodes -key "$CERT_DIR/ca.key" -sha256 -days 3650 \
-        -out "$CERT_DIR/ca.crt" -subj "/CN=AFTERLIFE Local CA" >/dev/null 2>&1
+        -out "$CERT_DIR/ca.crt" -config "$CERT_DIR/openssl-ca.cnf" >/dev/null 2>&1
 
     openssl genrsa -out "$CERT_DIR/server.key" 4096 >/dev/null 2>&1
     openssl req -new -key "$CERT_DIR/server.key" -out "$CERT_DIR/server.csr" \
         -config "$CERT_DIR/openssl-server.cnf" >/dev/null 2>&1
     openssl x509 -req -in "$CERT_DIR/server.csr" -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" \
         -CAcreateserial -out "$CERT_DIR/server.crt" -days "$DEFAULT_CERT_DAYS" -sha256 \
-        -extensions req_ext -extfile "$CERT_DIR/openssl-server.cnf" >/dev/null 2>&1
+        -copy_extensions copyall -extfile "$CERT_DIR/openssl-server.cnf" -extensions req_ext >/dev/null 2>&1
 
-    chmod 600 "$CERT_DIR/ca.key" "$CERT_DIR/server.key" || true
+    cat "$CERT_DIR/server.crt" "$CERT_DIR/server.key" > "$CERT_DIR/server.pem"
+
+    chmod 600 "$CERT_DIR/ca.key" "$CERT_DIR/server.key" "$CERT_DIR/server.pem" || true
     chmod 644 "$CERT_DIR/ca.crt" "$CERT_DIR/server.crt" || true
     rm -f "$CERT_DIR/server.csr" "$CERT_DIR/ca.srl"
+
+    verify_server_certificate
     success "Certificates generated in ${CERT_DIR}/"
 }
 
@@ -169,12 +243,23 @@ show_summary() {
     echo -e "${GREEN}========================================${RESET}"
     echo "Server certificate : ${CERT_DIR}/server.crt"
     echo "Server private key : ${CERT_DIR}/server.key"
+    echo "Combined server PEM: ${CERT_DIR}/server.pem"
     echo "Client trust CA    : ${CERT_DIR}/ca.crt"
-    echo "Server SAN name/IP : ${SERVER_NAME}"
+    echo "Server SAN name/IP : ${SERVER_NAME} (${SERVER_NAME_TYPE})"
     echo "Exposed port       : ${EXPOSE_PORT}"
     echo
-    echo "Client example:"
-    echo "  python3 client.py --host ${SERVER_NAME} --port ${EXPOSE_PORT} --cert ${CERT_DIR}/ca.crt"
+    if [[ "$SERVER_NAME_TYPE" == "ip" ]]; then
+        echo "Raw IP detected. Client must connect directly to that IP without --server-name."
+        echo "Client example:"
+        echo "  python3 client.py --host ${SERVER_NAME} --port ${EXPOSE_PORT} --cert ${CERT_DIR}/ca.crt"
+    else
+        echo "DNS name detected. Client should verify against that hostname."
+        echo "Client example:"
+        echo "  python3 client.py --host ${SERVER_NAME} --port ${EXPOSE_PORT} --cert ${CERT_DIR}/ca.crt --server-name ${SERVER_NAME}"
+    fi
+    echo
+    echo "Quick SAN check:"
+    echo "  openssl x509 -in ${CERT_DIR}/server.crt -noout -text | grep -A1 'Subject Alternative Name'"
 }
 
 main() {
