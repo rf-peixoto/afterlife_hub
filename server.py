@@ -5,9 +5,9 @@ import argparse
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
-import queue
 import re
 import secrets
 import socket
@@ -18,9 +18,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
+from cryptography import x509
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+from cryptography.x509.oid import NameOID
 
 # =========================
 # Configuration
@@ -38,6 +41,7 @@ MAX_NICK_LEN = 24
 MIN_PASSWORD_LEN = 8
 MAX_REWARD = 99_999_999
 MAX_CONTACT_INFO_LEN = 128
+BAN_LABEL = "[banned]"
 MAX_REQUEST_LINE_BYTES = int(os.environ.get("AFTERLIFE_MAX_REQUEST_LINE_BYTES", "8192"))
 MAX_JSON_DEPTH = int(os.environ.get("AFTERLIFE_MAX_JSON_DEPTH", "16"))
 MAX_PARSE_ERRORS_PER_WINDOW = int(os.environ.get("AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW", "10"))
@@ -64,6 +68,9 @@ SESSION_IDLE_SECONDS = 3600
 
 BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME", "admin")
 BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
+
+# TLS hardening
+TLS_MIN_VERSION = ssl.TLSVersion.TLSv1_2
 
 
 # =========================
@@ -103,6 +110,172 @@ def pbkdf2_verify(value: str, stored: str) -> bool:
 def derive_fernet_key(master_secret: bytes) -> bytes:
     digest = hashlib.sha256(master_secret).digest()
     return base64.urlsafe_b64encode(digest)
+
+
+def is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def format_x509_name(name: x509.Name) -> str:
+    parts = []
+    for attr in name:
+        try:
+            key = attr.oid._name or attr.oid.dotted_string
+        except Exception:
+            key = attr.oid.dotted_string
+        parts.append(f"{key}={attr.value}")
+    return ", ".join(parts)
+
+
+def get_common_name(name: x509.Name) -> str:
+    try:
+        attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
+        if attrs:
+            return str(attrs[0].value)
+    except Exception:
+        pass
+    return ""
+
+
+@dataclass
+class CertificateInfo:
+    subject: str
+    issuer: str
+    common_name: str
+    san_dns: list[str]
+    san_ip: list[str]
+    not_valid_before: str
+    not_valid_after: str
+    expired: bool
+    not_yet_valid: bool
+
+
+def read_certificate_info(cert_path: Path) -> CertificateInfo:
+    raw = cert_path.read_bytes()
+    cert = x509.load_pem_x509_certificate(raw)
+
+    san_dns: list[str] = []
+    san_ip: list[str] = []
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        san_dns = [str(v) for v in san.get_values_for_type(x509.DNSName)]
+        san_ip = [str(v) for v in san.get_values_for_type(x509.IPAddress)]
+    except x509.ExtensionNotFound:
+        pass
+
+    now = time.time()
+    not_before_ts = cert.not_valid_before_utc.timestamp()
+    not_after_ts = cert.not_valid_after_utc.timestamp()
+
+    return CertificateInfo(
+        subject=format_x509_name(cert.subject),
+        issuer=format_x509_name(cert.issuer),
+        common_name=get_common_name(cert.subject),
+        san_dns=san_dns,
+        san_ip=san_ip,
+        not_valid_before=cert.not_valid_before_utc.isoformat(),
+        not_valid_after=cert.not_valid_after_utc.isoformat(),
+        expired=now > not_after_ts,
+        not_yet_valid=now < not_before_ts,
+    )
+
+
+def read_private_key_pem_bytes(certfile: Path, keyfile: Optional[Path]) -> bytes:
+    if keyfile is not None:
+        return keyfile.read_bytes()
+
+    # Support combined PEM in --cert
+    raw = certfile.read_text(encoding="utf-8", errors="ignore")
+    begin = "-----BEGIN PRIVATE KEY-----"
+    end = "-----END PRIVATE KEY-----"
+    rsa_begin = "-----BEGIN RSA PRIVATE KEY-----"
+    rsa_end = "-----END RSA PRIVATE KEY-----"
+    ec_begin = "-----BEGIN EC PRIVATE KEY-----"
+    ec_end = "-----END EC PRIVATE KEY-----"
+
+    for b, e in (
+        (begin, end),
+        (rsa_begin, rsa_end),
+        (ec_begin, ec_end),
+    ):
+        start = raw.find(b)
+        finish = raw.find(e)
+        if start != -1 and finish != -1 and finish > start:
+            finish += len(e)
+            return raw[start:finish].encode("utf-8")
+
+    raise RuntimeError(
+        "No private key found in --cert PEM. Supply --key or use a combined PEM containing both certificate and key."
+    )
+
+
+def extract_public_key_bytes_from_cert(cert_path: Path) -> bytes:
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    return cert.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+
+
+def extract_public_key_bytes_from_private_key_pem(key_pem: bytes) -> bytes:
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key, PublicFormat
+
+    private_key = load_pem_private_key(key_pem, password=None)
+    return private_key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+
+
+def ensure_cert_key_match(cert_path: Path, key_path: Optional[Path]) -> None:
+    key_pem = read_private_key_pem_bytes(cert_path, key_path)
+    cert_pub = extract_public_key_bytes_from_cert(cert_path)
+    key_pub = extract_public_key_bytes_from_private_key_pem(key_pem)
+    if cert_pub != key_pub:
+        raise RuntimeError("TLS certificate and private key do not match.")
+
+
+def validate_tls_files(cert_path: Path, key_path: Optional[Path]) -> None:
+    if not cert_path.is_file():
+        raise RuntimeError(f"TLS certificate file not found: {cert_path}")
+    if key_path is not None and not key_path.is_file():
+        raise RuntimeError(f"TLS private key file not found: {key_path}")
+    ensure_cert_key_match(cert_path, key_path)
+
+
+def startup_log_certificate_info(info: CertificateInfo, advertised_name: Optional[str]) -> None:
+    log(f"TLS certificate subject: {info.subject}")
+    log(f"TLS certificate issuer: {info.issuer}")
+    if info.common_name:
+        log(f"TLS certificate common name: {info.common_name}")
+    log(f"TLS certificate validity: {info.not_valid_before} -> {info.not_valid_after}")
+
+    if info.san_dns or info.san_ip:
+        san_chunks = []
+        if info.san_dns:
+            san_chunks.append("DNS=" + ", ".join(info.san_dns))
+        if info.san_ip:
+            san_chunks.append("IP=" + ", ".join(info.san_ip))
+        log("TLS certificate SANs: " + " | ".join(san_chunks))
+    else:
+        log("WARNING: TLS certificate has no SAN extension. Modern clients should reject such certificates.")
+
+    if info.not_yet_valid:
+        log("WARNING: TLS certificate is not yet valid according to current system time.")
+    if info.expired:
+        log("WARNING: TLS certificate is expired.")
+
+    if advertised_name:
+        if is_ip_address(advertised_name):
+            if advertised_name not in info.san_ip:
+                log(
+                    "WARNING: advertised TLS name is an IP that is not present in the certificate SAN IP list. "
+                    "Production clients validating that IP should fail."
+                )
+        else:
+            if advertised_name not in info.san_dns:
+                log(
+                    "WARNING: advertised TLS name is not present in the certificate SAN DNS list. "
+                    "Production clients validating that hostname should fail."
+                )
 
 
 class CryptoBox:
@@ -195,8 +368,6 @@ def validate_contact_info(contact_info: str) -> Optional[str]:
     return None
 
 
-
-
 def json_depth(value: Any, depth: int = 0) -> int:
     if depth > MAX_JSON_DEPTH:
         return depth
@@ -217,6 +388,7 @@ def ensure_request_shape(request: Any) -> Optional[str]:
     if json_depth(request) > MAX_JSON_DEPTH:
         return f"JSON nesting exceeds limit of {MAX_JSON_DEPTH}."
     return None
+
 
 # =========================
 # Database
@@ -248,6 +420,7 @@ class Database:
                     contact_info_enc TEXT NOT NULL DEFAULT '',
                     reputation INTEGER NOT NULL DEFAULT 0,
                     is_admin INTEGER NOT NULL DEFAULT 0,
+                    is_banned INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
 
@@ -284,6 +457,8 @@ class Database:
         user_columns = {row["name"] for row in con.execute("PRAGMA table_info(users)").fetchall()}
         if "contact_info_enc" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN contact_info_enc TEXT NOT NULL DEFAULT ''")
+        if "is_banned" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_bootstrap_admin(self) -> None:
         with self.lock, self.conn() as con:
@@ -298,7 +473,7 @@ class Database:
                     "Set AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD to a strong secret before starting the server."
                 )
             con.execute(
-                "INSERT INTO users (nickname, password_hash, reputation, is_admin, created_at) VALUES (?, ?, 0, 1, ?)",
+                "INSERT INTO users (nickname, password_hash, reputation, is_admin, is_banned, created_at) VALUES (?, ?, 0, 1, 0, ?)",
                 (BOOTSTRAP_ADMIN_USERNAME, pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD), int(time.time())),
             )
             log("Bootstrap admin account created from operator-supplied secret.")
@@ -307,7 +482,7 @@ class Database:
         with self.lock, self.conn() as con:
             try:
                 con.execute(
-                    "INSERT INTO users (nickname, password_hash, contact_info_enc, reputation, is_admin, created_at) VALUES (?, ?, ?, 0, 0, ?)",
+                    "INSERT INTO users (nickname, password_hash, contact_info_enc, reputation, is_admin, is_banned, created_at) VALUES (?, ?, ?, 0, 0, 0, ?)",
                     (nickname, pbkdf2_hash(password), crypto.enc(contact_info), int(time.time())),
                 )
                 return True, "User created."
@@ -317,9 +492,11 @@ class Database:
     def authenticate(self, nickname: str, password: str) -> Optional[sqlite3.Row]:
         with self.lock, self.conn() as con:
             row = con.execute(
-                "SELECT id, nickname, password_hash, contact_info_enc, reputation, is_admin, created_at FROM users WHERE nickname = ?",
+                "SELECT id, nickname, password_hash, contact_info_enc, reputation, is_admin, is_banned, created_at FROM users WHERE nickname = ?",
                 (nickname,),
             ).fetchone()
+            if row and bool(row["is_banned"]):
+                return None
             if row and pbkdf2_verify(password, row["password_hash"]):
                 return row
             return None
@@ -327,9 +504,43 @@ class Database:
     def get_user(self, user_id: int) -> Optional[sqlite3.Row]:
         with self.lock, self.conn() as con:
             return con.execute(
-                "SELECT id, nickname, contact_info_enc, reputation, is_admin, created_at FROM users WHERE id = ?",
+                "SELECT id, nickname, contact_info_enc, reputation, is_admin, is_banned, created_at FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
+
+    def get_user_by_nickname(self, nickname: str) -> Optional[sqlite3.Row]:
+        with self.lock, self.conn() as con:
+            return con.execute(
+                "SELECT id, nickname, contact_info_enc, reputation, is_admin, is_banned, created_at FROM users WHERE nickname = ?",
+                (nickname,),
+            ).fetchone()
+
+    def ban_user(self, actor_id: int, nickname: str) -> tuple[bool, str, Optional[int]]:
+        with self.lock, self.conn() as con:
+            actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
+            if actor is None or not bool(actor["is_admin"]):
+                return False, "Not allowed.", None
+            target = con.execute("SELECT id, nickname, is_admin, is_banned FROM users WHERE nickname = ?", (nickname,)).fetchone()
+            if target is None:
+                return False, "User not found.", None
+            if bool(target["is_admin"]):
+                return False, "Admin accounts cannot be banned.", None
+            if bool(target["is_banned"]):
+                return False, "User is already banned.", int(target["id"])
+            con.execute("UPDATE users SET is_banned = 1 WHERE id = ?", (target["id"],))
+            con.execute("DELETE FROM job_accepts WHERE user_id = ?", (target["id"],))
+            con.execute("UPDATE jobs SET selected_worker_id = NULL, updated_at = ? WHERE selected_worker_id = ? AND status = 'open'", (int(time.time()), target["id"]))
+            return True, "User banned permanently.", int(target["id"])
+
+    def delete_job(self, actor_id: int, job_id: int) -> tuple[bool, str]:
+        with self.lock, self.conn() as con:
+            actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
+            if actor is None or not bool(actor["is_admin"]):
+                return False, "Not allowed."
+            cur = con.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            if cur.rowcount == 0:
+                return False, "Job not found."
+            return True, "Job deleted."
 
     def create_job(self, author_id: int, title: str, description: str, reward: int, is_private: bool) -> dict[str, Any]:
         now = int(time.time())
@@ -359,7 +570,7 @@ class Database:
     def list_jobs(self, status: Optional[str] = None) -> list[dict[str, Any]]:
         with self.lock, self.conn() as con:
             query = (
-                "SELECT j.*, u.nickname AS author_nickname, "
+                "SELECT j.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned, "
                 "(SELECT COUNT(*) FROM job_accepts a WHERE a.job_id = j.id) AS accept_count "
                 "FROM jobs j JOIN users u ON u.id = j.author_id "
             )
@@ -383,7 +594,7 @@ class Database:
         with self.lock, self.conn() as con:
             rows = con.execute(
                 """
-                SELECT j.*, u.nickname AS author_nickname,
+                SELECT j.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned,
                        (SELECT COUNT(*) FROM job_accepts a WHERE a.job_id = j.id) AS accept_count
                 FROM jobs j
                 JOIN job_accepts ja ON ja.job_id = j.id
@@ -403,7 +614,7 @@ class Database:
     def get_job(self, job_id: int) -> Optional[sqlite3.Row]:
         with self.lock, self.conn() as con:
             return con.execute(
-                "SELECT j.*, u.nickname AS author_nickname FROM jobs j JOIN users u ON u.id = j.author_id WHERE j.id = ?",
+                "SELECT j.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned FROM jobs j JOIN users u ON u.id = j.author_id WHERE j.id = ?",
                 (job_id,),
             ).fetchone()
 
@@ -436,7 +647,7 @@ class Database:
 
             if is_author or is_admin:
                 workers = con.execute(
-                    "SELECT u.id, u.nickname, u.contact_info_enc, u.reputation FROM job_accepts a JOIN users u ON u.id = a.user_id WHERE a.job_id = ? ORDER BY a.created_at ASC",
+                    "SELECT u.id, u.nickname, u.contact_info_enc, u.reputation, u.is_banned FROM job_accepts a JOIN users u ON u.id = a.user_id WHERE a.job_id = ? ORDER BY a.created_at ASC",
                     (job_id,),
                 ).fetchall()
                 data["worker_pool"] = [
@@ -445,6 +656,7 @@ class Database:
                         "nickname": str(w["nickname"]),
                         "contact_info": crypto.dec(w["contact_info_enc"]),
                         "reputation": int(w["reputation"]),
+                        "is_banned": bool(w["is_banned"]),
                     }
                     for w in workers
                 ]
@@ -504,6 +716,9 @@ class Database:
             ).fetchone()
             if accepted is None:
                 return False, "Worker is not in the pool."
+            banned_worker = con.execute("SELECT is_banned FROM users WHERE id = ?", (worker_id,)).fetchone()
+            if banned_worker is None or bool(banned_worker["is_banned"]):
+                return False, "Worker is banned."
             con.execute(
                 "UPDATE jobs SET selected_worker_id = ?, updated_at = ? WHERE id = ?",
                 (worker_id, int(time.time()), job_id),
@@ -540,6 +755,9 @@ class Database:
             return True, f"Job status set to {new_status}."
 
     def _job_row_to_public_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        author_is_banned = bool(row["author_is_banned"]) if "author_is_banned" in row.keys() else False
+        author_nickname = str(row["author_nickname"])
+        author_display = f"{BAN_LABEL} {author_nickname}" if author_is_banned else author_nickname
         return {
             "id": row["id"],
             "title": crypto.dec(row["title_enc"]),
@@ -547,7 +765,9 @@ class Database:
             "is_private": bool(row["is_private"]),
             "status": row["status"],
             "author_id": row["author_id"],
-            "author_nickname": row["author_nickname"],
+            "author_nickname": author_nickname,
+            "author_is_banned": author_is_banned,
+            "author_display": author_display,
             "accept_count": row["accept_count"] if "accept_count" in row.keys() else 0,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -619,6 +839,12 @@ class SessionStore:
             return
         with self.lock:
             self.sessions.pop(token, None)
+
+    def delete_user_sessions(self, user_id: int) -> None:
+        with self.lock:
+            doomed = [token for token, session in self.sessions.items() if session.user_id == user_id]
+            for token in doomed:
+                self.sessions.pop(token, None)
 
 
 class SlidingWindowLimiter:
@@ -716,6 +942,8 @@ VALID_ACTIONS = {
     "withdraw_job",
     "select_worker",
     "set_status",
+    "delete_job",
+    "ban_user",
 }
 
 
@@ -723,6 +951,13 @@ def require_session(request: dict[str, Any]) -> tuple[Optional[Session], Optiona
     session = sessions.get(request.get("session_token"))
     if not session:
         return None, err("Authentication required.", "auth_required")
+    user = db.get_user(session.user_id)
+    if user is None:
+        sessions.delete(session.token)
+        return None, err("User not found.", "auth_required")
+    if bool(user["is_banned"]):
+        sessions.delete(session.token)
+        return None, err("This account is banned.", "account_banned")
     return session, None
 
 
@@ -756,6 +991,11 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         allowed_login, retry = login_throttle.check(ip, nickname)
         if not allowed_login:
             return err("Login temporarily blocked for this nickname from your address.", "login_throttled", retry)
+        known_user = db.get_user_by_nickname(nickname)
+        if known_user is not None and bool(known_user["is_banned"]):
+            login_throttle.fail(ip, nickname)
+            time.sleep(1.0)
+            return err("This account is banned.", "account_banned")
         user = db.authenticate(nickname, password)
         if not user:
             login_throttle.fail(ip, nickname)
@@ -789,6 +1029,8 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
                 "contact_info": crypto.dec(user["contact_info_enc"]),
                 "reputation": user["reputation"],
                 "created_at": user["created_at"],
+                "is_admin": bool(user["is_admin"]),
+                "is_banned": bool(user["is_banned"]),
             }
         )
 
@@ -881,6 +1123,31 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         status = str(request.get("status", "")).strip().lower()
         success, message = db.set_job_status(job_id, session.user_id, status)
         return ok(message=message) if success else err(message, "status_failed")
+
+    if action == "delete_job":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        try:
+            job_id = int(request.get("job_id"))
+        except Exception:
+            return err("Invalid job id.", "validation_error")
+        success, message = db.delete_job(session.user_id, job_id)
+        return ok(message=message) if success else err(message, "delete_failed")
+
+    if action == "ban_user":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        nickname = str(request.get("nickname", "")).strip()
+        problem = validate_nickname(nickname)
+        if problem:
+            return err(problem, "validation_error")
+        success, message, banned_user_id = db.ban_user(session.user_id, nickname)
+        if success and banned_user_id is not None:
+            sessions.delete_user_sessions(banned_user_id)
+            return ok(message=message)
+        return err(message, "ban_failed")
 
     return err("Unknown action.", "unknown_action")
 
@@ -1009,8 +1276,16 @@ class Server:
 
 def build_server_ssl_context(certfile: str, keyfile: Optional[str]) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.minimum_version = TLS_MIN_VERSION
     context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+
+    # Conservative hardening for TLS 1.2 suites.
+    # TLS 1.3 suites are managed separately by OpenSSL and are not configured here.
+    try:
+        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:!aNULL:!eNULL:!MD5:!RC4:!3DES:!DES:!EXPORT:!PSK")
+    except ssl.SSLError:
+        pass
+
     return context
 
 
@@ -1036,15 +1311,35 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional private key PEM path when the key is not embedded in --cert.",
     )
+    parser.add_argument(
+        "--advertised-name",
+        default=None,
+        help=(
+            "Optional hostname or IP that clients are expected to validate. "
+            "Used only for startup certificate SAN warnings."
+        ),
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
     try:
         db = Database(DB_PATH)
     except Exception as exc:
         log(f"Unable to initialize database/bootstrap state: {exc}")
+        raise SystemExit(1)
+
+    cert_path = Path(args.cert)
+    key_path = Path(args.key) if args.key else None
+
+    try:
+        validate_tls_files(cert_path, key_path)
+        cert_info = read_certificate_info(cert_path)
+        startup_log_certificate_info(cert_info, args.advertised_name)
+    except Exception as exc:
+        log(f"Unable to validate TLS certificate material: {exc}")
         raise SystemExit(1)
 
     try:

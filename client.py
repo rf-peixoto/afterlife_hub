@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import json
 import os
 import socket
@@ -11,6 +12,7 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 # =========================
@@ -33,7 +35,6 @@ MAGENTA = "\033[35m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 WHITE = "\033[37m"
-
 
 STATUS_COLORS = {
     "OPEN": GREEN,
@@ -117,6 +118,45 @@ def boot_sequence() -> None:
         time.sleep(BOOT_DELAY)
 
 
+def is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def explain_ssl_error(exc: ssl.SSLError) -> str:
+    text = str(exc)
+
+    lowered = text.lower()
+    if "hostname" in lowered or "doesn't match" in lowered or "does not match" in lowered:
+        return (
+            f"{exc}\n"
+            "certificate hostname validation failed. "
+            "the certificate SAN must match the server name used by the client."
+        )
+    if "self-signed certificate" in lowered:
+        return (
+            f"{exc}\n"
+            "the server presented a self-signed certificate that is not trusted by this client. "
+            "use --cert with the issuing CA or the pinned server certificate."
+        )
+    if "unable to get local issuer certificate" in lowered or "unknown ca" in lowered:
+        return (
+            f"{exc}\n"
+            "the client does not trust the certificate chain presented by the server. "
+            "provide the correct CA bundle with --cert."
+        )
+    if "certificate verify failed" in lowered:
+        return (
+            f"{exc}\n"
+            "tls verification failed. confirm that the certificate chain is trusted and "
+            "that the hostname/IP matches the certificate SAN."
+        )
+    return text
+
+
 @dataclass
 class RemoteClient:
     host: str
@@ -125,16 +165,21 @@ class RemoteClient:
     server_hostname: str
     session_token: Optional[str] = None
     nickname: Optional[str] = None
+    is_admin: bool = False
 
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.session_token:
             payload.setdefault("session_token", self.session_token)
+
         raw = json.dumps(payload).encode("utf-8") + b"\n"
+
         with socket.create_connection((self.host, self.port), timeout=SOCKET_TIMEOUT) as tcp_sock:
             tcp_sock.settimeout(SOCKET_TIMEOUT)
+
             with self.ssl_context.wrap_socket(tcp_sock, server_hostname=self.server_hostname) as sock:
                 sock.settimeout(SOCKET_TIMEOUT)
                 sock.sendall(raw)
+
                 chunks = b""
                 while not chunks.endswith(b"\n"):
                     data = sock.recv(4096)
@@ -143,8 +188,10 @@ class RemoteClient:
                     chunks += data
                     if len(chunks) > MAX_RESPONSE_BYTES:
                         raise RuntimeError(f"Server response exceeded {MAX_RESPONSE_BYTES} bytes.")
+
         if not chunks:
             raise RuntimeError("No response from server.")
+
         return json.loads(chunks.decode("utf-8").strip())
 
     def ping(self) -> bool:
@@ -164,14 +211,12 @@ def ask(prompt_text: str, allow_blank: bool = False) -> str:
         print(c("input required.", RED))
 
 
-
 def ask_hidden(prompt_text: str) -> str:
     while True:
         value = getpass.getpass(prompt(prompt_text)).strip()
         if value:
             return value
         print(c("input required.", RED))
-
 
 
 def ask_int(prompt_text: str) -> int:
@@ -181,7 +226,6 @@ def ask_int(prompt_text: str) -> int:
             return int(raw)
         except ValueError:
             print(c("enter a valid number.", RED))
-
 
 
 def yes_no(prompt_text: str) -> bool:
@@ -194,10 +238,8 @@ def yes_no(prompt_text: str) -> bool:
         print(c("answer with yes or no.", RED))
 
 
-
 def normalize_choice(value: str) -> str:
     return value.strip().lower().replace("_", " ").replace("-", " ")
-
 
 
 def choose(prompt_text: str, mapping: dict[str, str]) -> str:
@@ -207,7 +249,6 @@ def choose(prompt_text: str, mapping: dict[str, str]) -> str:
         if value in normalized:
             return normalized[value]
         print(c("unknown option.", RED))
-
 
 
 def show_result(response: dict[str, Any]) -> None:
@@ -240,10 +281,11 @@ def print_jobs(jobs: list[dict[str, Any]], include_author: bool = True, complete
         key_value("Status", status_badge(status))
         if not completed_mode:
             key_value("Accepts", str(job.get("accept_count", 0)))
-            if include_author and job.get("author_nickname"):
-                key_value("Author", str(job["author_nickname"]))
+            if include_author and job.get("author_display"):
+                author_text = str(job["author_display"])
+                author_color = YELLOW if job.get("author_is_banned") else WHITE
+                key_value("Author", author_text, author_color)
         print(line())
-
 
 
 def print_job_details(data: dict[str, Any]) -> None:
@@ -253,7 +295,9 @@ def print_job_details(data: dict[str, Any]) -> None:
     print(line("·"))
     key_value("Reward", str(data["reward"]))
     key_value("Status", status_badge(str(data["status"])))
-    key_value("Author", str(data["author_nickname"]))
+    author_value = str(data.get("author_display") or data["author_nickname"])
+    author_color = YELLOW if data.get("author_is_banned") else WHITE
+    key_value("Author", author_value, author_color)
     key_value("Private", "yes" if data["is_private"] else "no", YELLOW if data["is_private"] else WHITE)
     key_value("Accepts", str(data.get("accept_count", 0)))
     print()
@@ -272,9 +316,11 @@ def print_job_details(data: dict[str, Any]) -> None:
         if workers:
             for worker in workers:
                 marker = c("  << SELECTED >>", GREEN) if data.get("selected_worker_id") == worker["id"] else ""
+                worker_name = f"[banned] {worker["nickname"]}" if worker.get("is_banned") else worker["nickname"]
+                worker_color = YELLOW if worker.get("is_banned") else WHITE
                 print(
                     c(f"  [{worker['id']}] ", MAGENTA)
-                    + c(worker["nickname"], WHITE)
+                    + c(worker_name, worker_color)
                     + c(f"  rep={worker['reputation']}", DIM)
                     + marker
                 )
@@ -283,53 +329,109 @@ def print_job_details(data: dict[str, Any]) -> None:
             print(c("  no workers assigned yet.", DIM))
 
 
+def build_ssl_context(cert_path: str | None = None, insecure: bool = False) -> ssl.SSLContext:
+    """
+    Secure mode:
+      - certificate verification required
+      - hostname verification required
 
-def build_ssl_context(cert_path: str) -> ssl.SSLContext:
+    Insecure mode:
+      - certificate verification disabled
+      - hostname verification disabled
+      - testing only
+    """
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_REQUIRED
-    context.load_verify_locations(cafile=cert_path)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    if insecure:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+
+    if cert_path:
+        context.load_verify_locations(cafile=cert_path)
+
     return context
 
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.insecure:
+        if not args.cert:
+            raise SystemExit("secure mode requires --cert pointing to a trusted PEM CA bundle or pinned server certificate")
+        cert_file = Path(args.cert)
+        if not cert_file.is_file():
+            raise SystemExit(f"trusted PEM file not found: {args.cert}")
+
+    if args.port < 1 or args.port > 65535:
+        raise SystemExit("port must be between 1 and 65535")
 
 
 def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     clear()
-    section("NODE LINK // TLS REQUIRED")
-    key_value("Trust PEM", args.cert, CYAN)
+    subtitle = "tls verification enabled" if not args.insecure else "WARNING: insecure testing mode"
+    section("NODE LINK // TLS REQUIRED", subtitle)
+
+    key_value("Trust PEM", args.cert if args.cert else "(system/default)", CYAN)
+    if args.server_name:
+        key_value("TLS Name", args.server_name, CYAN)
     print()
+
+    if args.insecure:
+        print(c("[ WARNING ] --insecure disables certificate and hostname verification. testing only.", YELLOW + BOLD))
+        print(line("·"))
+
     boot_sequence()
     print(line("·"))
 
     host = ask(f"uplink host [{args.host}]> ", allow_blank=True) or args.host
     port_raw = ask(f"uplink port [{args.port}]> ", allow_blank=True) or str(args.port)
+
     try:
         port = int(port_raw)
     except ValueError:
         port = args.port
+
     server_name = args.server_name or host
+
+    if not args.insecure and is_ip_address(host) and not args.server_name:
+        print(c(
+            "[ NOTICE ] you are connecting to a raw IP without --server-name.\n"
+            "production certificates often validate against a DNS name. this only works if the certificate SAN includes that IP.",
+            YELLOW,
+        ))
+        print(line("·"))
+
     client = RemoteClient(
         host=host,
         port=port,
-        ssl_context=build_ssl_context(args.cert),
+        ssl_context=build_ssl_context(args.cert, insecure=args.insecure),
         server_hostname=server_name,
     )
+
     try:
         if client.ping():
             print(c("[ LINK UP ] encrypted session established.", GREEN))
             key_value("Remote", f"{host}:{port}", CYAN)
+            key_value("TLS peer", server_name, CYAN)
         else:
             print(c("[ LINK ERROR ] server responded unexpectedly.", RED))
+    except ssl.SSLCertVerificationError as exc:
+        print(c("[ TLS FAILURE ] certificate verification error", RED + BOLD))
+        print(c(wrap(explain_ssl_error(exc)), RED))
+        sys.exit(1)
     except ssl.SSLError as exc:
-        print(c(f"[ TLS FAILURE ] {exc}", RED))
+        print(c("[ TLS FAILURE ] ssl error", RED + BOLD))
+        print(c(wrap(explain_ssl_error(exc)), RED))
         sys.exit(1)
     except Exception as exc:
         print(c(f"[ CONNECTION FAILURE ] {exc}", RED))
         sys.exit(1)
+
     time.sleep(0.5)
     return client
-
 
 
 def auth_menu(client: RemoteClient) -> None:
@@ -352,6 +454,7 @@ def auth_menu(client: RemoteClient) -> None:
                 data = response.get("data", {})
                 client.session_token = data.get("session_token")
                 client.nickname = data.get("nickname")
+                client.is_admin = bool(data.get("is_admin"))
                 time.sleep(0.6)
             else:
                 pause()
@@ -359,12 +462,18 @@ def auth_menu(client: RemoteClient) -> None:
             nickname = ask("new nickname> ")
             password = ask_hidden("new password> ")
             contact_info = ask("contact info> ")
-            response = client.request({"action": "register", "nickname": nickname, "password": password, "contact_info": contact_info})
+            response = client.request(
+                {
+                    "action": "register",
+                    "nickname": nickname,
+                    "password": password,
+                    "contact_info": contact_info,
+                }
+            )
             show_result(response)
             pause()
         elif choice == "quit":
             raise SystemExit(0)
-
 
 
 def view_profile(client: RemoteClient) -> None:
@@ -376,12 +485,15 @@ def view_profile(client: RemoteClient) -> None:
         pause()
         return
     data = response["data"]
-    key_value("Nickname", data["nickname"], WHITE + BOLD)
+    nickname = data["nickname"]
+    if data.get("is_banned"):
+        nickname = f"[banned] {nickname}"
+    key_value("Nickname", nickname, YELLOW if data.get("is_banned") else WHITE + BOLD)
     key_value("Contact", data.get("contact_info", ""), CYAN)
     key_value("Reputation", str(data["reputation"]), CYAN)
+    key_value("Role", "admin" if data.get("is_admin") else "member", CYAN)
     print(line())
     pause()
-
 
 
 def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed_mode: bool = False) -> None:
@@ -396,7 +508,6 @@ def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed
     jobs = response["data"]["jobs"]
     print_jobs(jobs, completed_mode=completed_mode)
     pause()
-
 
 
 def create_job_menu(client: RemoteClient) -> None:
@@ -425,7 +536,6 @@ def create_job_menu(client: RemoteClient) -> None:
             print(c("[ PRIVATE TOKEN // STORE SECURELY ]", YELLOW + BOLD))
             print(c(data["private_token"], MAGENTA))
     pause()
-
 
 
 def job_details_menu(client: RemoteClient) -> None:
@@ -467,6 +577,9 @@ def job_details_menu(client: RemoteClient) -> None:
                 }
             )
             visible_actions = ["accept", "withdraw", "select worker", "done", "cancelled", "reopen", "back"]
+        if data.get("is_admin"):
+            actions.update({"delete": "delete"})
+            visible_actions.insert(-1, "delete")
         print(c("commands: " + ", ".join(visible_actions), CYAN))
         choice = choose("contract@view> ", actions)
         if choice == "accept":
@@ -494,6 +607,16 @@ def job_details_menu(client: RemoteClient) -> None:
             resp = client.request({"action": "set_status", "job_id": data["id"], "status": "open"})
             show_result(resp)
             pause()
+        elif choice == "delete" and data.get("is_admin"):
+            if yes_no(f"delete contract #{data['id']} permanently? [yes/no]> "):
+                resp = client.request({"action": "delete_job", "job_id": data["id"]})
+                show_result(resp)
+                pause()
+                if resp.get("ok"):
+                    return
+            else:
+                print(c("operation cancelled.", YELLOW))
+                pause()
         elif choice == "back":
             return
 
@@ -509,7 +632,6 @@ def job_details_menu(client: RemoteClient) -> None:
         data = refresh["data"]
 
 
-
 def my_jobs_menu(client: RemoteClient) -> None:
     clear()
     section("MY CONTRACTS // AUTHORED")
@@ -520,7 +642,6 @@ def my_jobs_menu(client: RemoteClient) -> None:
         return
     print_jobs(response["data"]["jobs"], include_author=False)
     pause()
-
 
 
 def my_accepts_menu(client: RemoteClient) -> None:
@@ -534,6 +655,22 @@ def my_accepts_menu(client: RemoteClient) -> None:
     print_jobs(response["data"]["jobs"], completed_mode=True)
     pause()
 
+
+
+def ban_user_menu(client: RemoteClient) -> None:
+    clear()
+    section("ADMIN BAN // PERMANENT ACTION")
+    print(c("this permanently bans a member account. input must match the exact nickname.", YELLOW))
+    print(line("·"))
+    nickname = ask("nickname to ban> ")
+    confirm = yes_no(f"ban {nickname} permanently? [yes/no]> ")
+    if not confirm:
+        print(c("operation cancelled.", YELLOW))
+        pause()
+        return
+    response = client.request({"action": "ban_user", "nickname": nickname})
+    show_result(response)
+    pause()
 
 
 def main_menu(client: RemoteClient) -> None:
@@ -553,6 +690,7 @@ def main_menu(client: RemoteClient) -> None:
         "my accepted": "my accepted",
         "accepted": "my accepted",
         "profile": "profile",
+        "ban": "ban",
         "logout": "logout",
         "quit": "quit",
         "exit": "quit",
@@ -560,12 +698,16 @@ def main_menu(client: RemoteClient) -> None:
     while True:
         clear()
         section("MAIN GRID // OPERATOR CONSOLE")
-        key_value("Operator", client.nickname or "unknown", GREEN)
-        print(c(
+        operator_label = (client.nickname or "unknown") + (" [admin]" if client.is_admin else "")
+        key_value("Operator", operator_label, GREEN)
+        commands = (
             "commands: open jobs, done jobs, cancelled jobs, create job, job details, "
-            "my authored jobs, my accepted, profile, logout, quit",
-            CYAN,
-        ))
+            "my authored jobs, my accepted, profile"
+        )
+        if client.is_admin:
+            commands += ", ban"
+        commands += ", logout, quit"
+        print(c(commands, CYAN))
         print(line("·"))
         choice = choose("afterlife@node> ", choices)
         if choice == "open jobs":
@@ -584,42 +726,58 @@ def main_menu(client: RemoteClient) -> None:
             my_accepts_menu(client)
         elif choice == "profile":
             view_profile(client)
+        elif choice == "ban":
+            if client.is_admin:
+                ban_user_menu(client)
+            else:
+                print(c("admin only option.", RED))
+                pause()
         elif choice == "logout":
             response = client.request({"action": "logout"})
             show_result(response)
             client.session_token = None
             client.nickname = None
+            client.is_admin = False
             pause()
             return
         elif choice == "quit":
             raise SystemExit(0)
 
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "AFTERLIFE client terminal. TLS is mandatory. Use --cert to point to the PEM certificate "
-            "or CA bundle used to validate the server certificate."
+            "AFTERLIFE client terminal. TLS is mandatory for production. "
+            "Use --cert to point to the trusted PEM CA bundle or pinned server certificate. "
+            "--insecure disables certificate and hostname verification and must only be used for testing."
         )
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Default server host/IP (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Default server port (default: {DEFAULT_PORT})")
     parser.add_argument(
         "--cert",
-        required=True,
+        default=None,
         help=(
-            "Path to the trusted PEM certificate or CA bundle. The client refuses plaintext and will abort "
-            "if TLS verification fails."
+            "Path to the trusted PEM CA bundle or pinned server certificate. "
+            "Required in secure mode."
         ),
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS certificate and hostname verification (testing only).",
     )
     parser.add_argument(
         "--server-name",
         default=None,
-        help="Optional TLS server name override for certificate matching/SNI when the socket target is an IP.",
+        help=(
+            "Optional TLS server name override for certificate matching/SNI. "
+            "Useful when connecting to a raw IP but validating a DNS certificate."
+        ),
     )
-    return parser.parse_args()
-
+    args = parser.parse_args()
+    validate_args(args)
+    return args
 
 
 def main() -> None:

@@ -1,45 +1,42 @@
 # AFTERLIFE
 
-AFTERLIFE is a private hub for freelancers accessible directly via terminal. Post your request in the public journal or, for more sensitive tasks, in the private journal. Users must register with contact information, and job authors can see accepted users plus their stored contact info in the worker pool.
+AFTERLIFE is a terminal-first freelancer hub with a TLS client/server split.
 
-This package contains two applications:
+This repository contains:
 
-- `server.py` - the remote job node that stores data, enforces validation, rate limiting, login throttling, connection caps, encrypted field storage, request-size guards, and mandatory TLS transport.
-- `client.py` - the terminal UX application that connects to the server over TLS and provides the interactive interface.
+- `server.py`: the hardened remote node.
+- `client.py`: the terminal interface that connects to the server over TLS.
+- `setup.sh`: Docker bootstrap that generates a local CA, signs the server certificate, writes `.env`, and starts the stack.
 
-## Important design notes
+## Current moderation/admin model
 
-- This is a raw JSON-line protocol server over TLS.
-- Sensitive user-generated fields are encrypted at rest using Fernet (`cryptography`).
-- This is **not** full-database encryption like SQLCipher. Table structure and some metadata remain visible.
-- The Fernet master key should be stored outside the main database path, ideally on a separate protected mount or external secret store. If disk theft or backup exposure is in scope, whole-database encryption is the better design.
-- Transport is no longer plaintext. The server will not start without a certificate, and the client refuses insecure connections.
+The admin account can now:
 
-## Generate certificates
+- delete any job from the job details view;
+- ban any non-admin user permanently from the main menu;
+- force banned users out of existing sessions.
 
-```bash
-openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -sha256 -nodes -subj "/CN=YOUR_SERVER_IP"
-```
+Behavior after a ban:
 
-## Features included
+- the banned user cannot log in again;
+- existing sessions are invalidated;
+- open job acceptances from that user are removed;
+- any open job where that user was selected is reset to no selected worker;
+- historical jobs created by that user remain visible, but the author name is shown as `[banned] username`.
 
-- register / login / logout
-- mandatory `contact_info` during registration
-- strict access controls
-- open / done / cancelled jobs
-- public and private jobs
-- private job token auto-generated with `secrets.token_urlsafe(16)`
-- selected worker logic
-- reputation increments only when a selected worker is credited on a `done` job
-- worker pool visible only to author or admin, including contact info for accepted users
-- completed/accepted lists omit descriptions
-- global per-IP rate limiting
-- invalid-traffic throttling for malformed JSON
-- login throttling per `IP + nickname`
-- request line length limit
-- client-side response size limit
-- bounded concurrency with connection caps and a worker pool
-- mandatory TLS on every request
+## Security model
+
+The current version enforces these controls:
+
+- mandatory TLS for all transport;
+- operator-supplied bootstrap admin secret;
+- encrypted storage for sensitive text fields with Fernet;
+- per-IP request throttling;
+- login throttling per `IP + nickname`;
+- request-size and JSON-depth guards;
+- bounded concurrency;
+- strict input validation with allowlists;
+- refusal of malformed values instead of attempting to sanitize them.
 
 ## Validation rules
 
@@ -51,130 +48,80 @@ Forbidden characters in validated text fields:
 - `/`
 - `%`
 
-Nickname:
-- 3 to 24 chars
-- letters, digits, underscore only
+Rules:
 
-Contact info:
-- 1 to 128 chars
-- letters, digits, spaces, `@`, `.`, `-`, `_` only
+- nickname: `^[A-Za-z0-9_]{3,24}$`
+- contact info: letters, digits, spaces, `@`, `.`, `-`, `_`, max 128
+- title: restricted printable subset, max 32
+- description: restricted printable subset, max 256
+- reward: digits only, from 1 to 99999999
 
-Title:
-- 1 to 32 chars
-- restricted printable subset
+If a value does not match the expected format, the server rejects it.
 
-Description:
-- 1 to 256 chars
-- restricted printable subset
+## Quick Docker deployment
 
-Reward:
-- digits only
-- range 1 to 99999999
-
-## Bootstrap admin
-
-The server no longer creates a bootstrap admin with a built-in default password.
-
-On first run, if the bootstrap admin account does not exist, you **must** provide an operator secret through environment variables:
+Run:
 
 ```bash
-export AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=admin
-export AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD='replace_this_with_a_real_secret'
+chmod +x setup.sh
+./setup.sh
 ```
 
-The server refuses to start if the bootstrap account would otherwise be auto-provisioned with an unsafe default.
+The script will ask for:
 
-## TLS usage
+- admin username;
+- admin password;
+- public hostname or IP to place in the server certificate SAN;
+- exposed port.
 
-You must provide a certificate on both sides.
+It then generates:
 
-### Server side
+- `certs/ca.crt` → give this to clients as the trust anchor;
+- `certs/server.crt` → server certificate;
+- `certs/server.key` → server private key.
 
-The server requires `--cert`.
-
-- If your PEM file already contains both the certificate and the private key, `--cert` is enough.
-- If the private key is stored separately, also pass `--key`.
-
-Examples:
+Client example after the stack is up:
 
 ```bash
-python3 server.py --cert server.pem
-python3 server.py --host 0.0.0.0 --port 5050 --cert server.crt --key server.key
+python3 client.py --host YOUR_SERVER_NAME_OR_IP --port 2077 --cert certs/ca.crt
 ```
 
-### Client side
+If the client connects by IP but the certificate was issued to a DNS name, pass the DNS name with `--server-name`.
 
-The client also requires `--cert`, but here it is used as the trusted certificate or CA bundle for server validation.
+## Manual local run
 
-Examples:
-
-```bash
-python3 client.py --cert server.pem
-python3 client.py --host 10.10.10.5 --port 5050 --cert ca.pem
-python3 client.py --host 10.10.10.5 --port 5050 --cert ca.pem --server-name afterlife.localhost
-```
-
-Use `--server-name` when the TCP connection is made to an IP but the certificate was issued for a hostname.
-
-## Quick start
-
-### 1. Install dependency
+Install dependencies:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-### 2. Start the server
+Generate a CA and a server certificate signed by it, or use your own PKI.
+
+Start the server:
 
 ```bash
-export AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD='replace_this_with_a_real_secret'
-python3 server.py --host 0.0.0.0 --port 5050 --cert server.crt --key server.key
+export AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=admin
+export AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD='replace_with_a_real_secret'
+python3 server.py --host 0.0.0.0 --port 2077 --cert server.crt --key server.key
 ```
 
-Default bind:
-
-- host: `0.0.0.0`
-- port: `5050`
-
-You can still override defaults with environment variables:
+Start the client:
 
 ```bash
-AFTERLIFE_HOST=0.0.0.0 AFTERLIFE_PORT=6000 python3 server.py --cert server.pem
+python3 client.py --host 127.0.0.1 --port 2077 --cert ca.crt
 ```
 
-Other useful environment variables:
-
-- `AFTERLIFE_DB_PATH`
-- `AFTERLIFE_MASTER_KEY_PATH`
-- `AFTERLIFE_LOG_PATH`
-- `AFTERLIFE_MAX_REQUEST_LINE_BYTES`
-- `AFTERLIFE_MAX_JSON_DEPTH`
-- `AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW`
-- `AFTERLIFE_MAX_CONNECTIONS`
-- `AFTERLIFE_MAX_WORKERS`
-
-## Help output
-
-Both applications include guided CLI help:
+## CLI help
 
 ```bash
 python3 server.py --help
 python3 client.py --help
 ```
 
-These help messages explain how `--cert`, `--key`, and `--server-name` should be used.
+## Protocol actions
 
-## Protocol overview
-
-The server expects one JSON object per line and answers with one JSON object per line, inside a TLS session.
-
-Example payload:
-
-```json
-{"action":"ping"}
-```
-
-Possible actions:
+Current actions include:
 
 - `ping`
 - `register`
@@ -190,22 +137,24 @@ Possible actions:
 - `withdraw_job`
 - `select_worker`
 - `set_status`
+- `delete_job` (admin)
+- `ban_user` (admin)
 
-## Remaining security notes
+## Docker notes
 
-Still relevant gaps and trade-offs:
+`docker-compose.yml` exposes the server on port `2077` inside the container and maps it to `${AFTERLIFE_EXPOSE_PORT}` on the host.
 
-- no MFA
-- no message-level signing beyond TLS
-- no moderation tooling beyond admin privileges
-- certificate lifecycle is still an operational responsibility of the admin
-- database field encryption is not a substitute for full-database encryption if the threat model includes disk or backup compromise
+The mounted paths are:
 
-## Files
+- `./certs` → `/app/certs`
+- `./data` → `/app/data`
 
-- `server.py`
-- `client.py`
-- `requirements.txt`
-- `README.md`
-- `Dockerfile`
-- `docker-compose.yml`
+## Remaining trade-offs
+
+This is improved, but not magically complete. Relevant limits still include:
+
+- no MFA;
+- no full-database encryption like SQLCipher;
+- no audit log integrity/signing;
+- no account recovery workflow;
+- certificate lifecycle and revocation remain operational tasks.
