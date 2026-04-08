@@ -11,7 +11,6 @@ import os
 import re
 import secrets
 import socket
-import ssl
 import sqlite3
 import threading
 import time
@@ -20,10 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from cryptography import x509
 from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
-from cryptography.x509.oid import NameOID
 
 # =========================
 # Configuration
@@ -66,11 +62,9 @@ AUTH_LOCK_SECONDS = 300
 READ_TIMEOUT_SECONDS = 180
 SESSION_IDLE_SECONDS = 3600
 
-BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME", "admin")
+# Bootstrap admin – these are mandatory when no admin exists yet
+BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME")
 BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
-
-# TLS hardening
-TLS_MIN_VERSION = ssl.TLSVersion.TLSv1_2
 
 
 # =========================
@@ -110,172 +104,6 @@ def pbkdf2_verify(value: str, stored: str) -> bool:
 def derive_fernet_key(master_secret: bytes) -> bytes:
     digest = hashlib.sha256(master_secret).digest()
     return base64.urlsafe_b64encode(digest)
-
-
-def is_ip_address(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
-
-
-def format_x509_name(name: x509.Name) -> str:
-    parts = []
-    for attr in name:
-        try:
-            key = attr.oid._name or attr.oid.dotted_string
-        except Exception:
-            key = attr.oid.dotted_string
-        parts.append(f"{key}={attr.value}")
-    return ", ".join(parts)
-
-
-def get_common_name(name: x509.Name) -> str:
-    try:
-        attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
-        if attrs:
-            return str(attrs[0].value)
-    except Exception:
-        pass
-    return ""
-
-
-@dataclass
-class CertificateInfo:
-    subject: str
-    issuer: str
-    common_name: str
-    san_dns: list[str]
-    san_ip: list[str]
-    not_valid_before: str
-    not_valid_after: str
-    expired: bool
-    not_yet_valid: bool
-
-
-def read_certificate_info(cert_path: Path) -> CertificateInfo:
-    raw = cert_path.read_bytes()
-    cert = x509.load_pem_x509_certificate(raw)
-
-    san_dns: list[str] = []
-    san_ip: list[str] = []
-    try:
-        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-        san_dns = [str(v) for v in san.get_values_for_type(x509.DNSName)]
-        san_ip = [str(v) for v in san.get_values_for_type(x509.IPAddress)]
-    except x509.ExtensionNotFound:
-        pass
-
-    now = time.time()
-    not_before_ts = cert.not_valid_before_utc.timestamp()
-    not_after_ts = cert.not_valid_after_utc.timestamp()
-
-    return CertificateInfo(
-        subject=format_x509_name(cert.subject),
-        issuer=format_x509_name(cert.issuer),
-        common_name=get_common_name(cert.subject),
-        san_dns=san_dns,
-        san_ip=san_ip,
-        not_valid_before=cert.not_valid_before_utc.isoformat(),
-        not_valid_after=cert.not_valid_after_utc.isoformat(),
-        expired=now > not_after_ts,
-        not_yet_valid=now < not_before_ts,
-    )
-
-
-def read_private_key_pem_bytes(certfile: Path, keyfile: Optional[Path]) -> bytes:
-    if keyfile is not None:
-        return keyfile.read_bytes()
-
-    # Support combined PEM in --cert
-    raw = certfile.read_text(encoding="utf-8", errors="ignore")
-    begin = "-----BEGIN PRIVATE KEY-----"
-    end = "-----END PRIVATE KEY-----"
-    rsa_begin = "-----BEGIN RSA PRIVATE KEY-----"
-    rsa_end = "-----END RSA PRIVATE KEY-----"
-    ec_begin = "-----BEGIN EC PRIVATE KEY-----"
-    ec_end = "-----END EC PRIVATE KEY-----"
-
-    for b, e in (
-        (begin, end),
-        (rsa_begin, rsa_end),
-        (ec_begin, ec_end),
-    ):
-        start = raw.find(b)
-        finish = raw.find(e)
-        if start != -1 and finish != -1 and finish > start:
-            finish += len(e)
-            return raw[start:finish].encode("utf-8")
-
-    raise RuntimeError(
-        "No private key found in --cert PEM. Supply --key or use a combined PEM containing both certificate and key."
-    )
-
-
-def extract_public_key_bytes_from_cert(cert_path: Path) -> bytes:
-    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-    return cert.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-
-
-def extract_public_key_bytes_from_private_key_pem(key_pem: bytes) -> bytes:
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key, PublicFormat
-
-    private_key = load_pem_private_key(key_pem, password=None)
-    return private_key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-
-
-def ensure_cert_key_match(cert_path: Path, key_path: Optional[Path]) -> None:
-    key_pem = read_private_key_pem_bytes(cert_path, key_path)
-    cert_pub = extract_public_key_bytes_from_cert(cert_path)
-    key_pub = extract_public_key_bytes_from_private_key_pem(key_pem)
-    if cert_pub != key_pub:
-        raise RuntimeError("TLS certificate and private key do not match.")
-
-
-def validate_tls_files(cert_path: Path, key_path: Optional[Path]) -> None:
-    if not cert_path.is_file():
-        raise RuntimeError(f"TLS certificate file not found: {cert_path}")
-    if key_path is not None and not key_path.is_file():
-        raise RuntimeError(f"TLS private key file not found: {key_path}")
-    ensure_cert_key_match(cert_path, key_path)
-
-
-def startup_log_certificate_info(info: CertificateInfo, advertised_name: Optional[str]) -> None:
-    log(f"TLS certificate subject: {info.subject}")
-    log(f"TLS certificate issuer: {info.issuer}")
-    if info.common_name:
-        log(f"TLS certificate common name: {info.common_name}")
-    log(f"TLS certificate validity: {info.not_valid_before} -> {info.not_valid_after}")
-
-    if info.san_dns or info.san_ip:
-        san_chunks = []
-        if info.san_dns:
-            san_chunks.append("DNS=" + ", ".join(info.san_dns))
-        if info.san_ip:
-            san_chunks.append("IP=" + ", ".join(info.san_ip))
-        log("TLS certificate SANs: " + " | ".join(san_chunks))
-    else:
-        log("WARNING: TLS certificate has no SAN extension. Modern clients should reject such certificates.")
-
-    if info.not_yet_valid:
-        log("WARNING: TLS certificate is not yet valid according to current system time.")
-    if info.expired:
-        log("WARNING: TLS certificate is expired.")
-
-    if advertised_name:
-        if is_ip_address(advertised_name):
-            if advertised_name not in info.san_ip:
-                log(
-                    "WARNING: advertised TLS name is an IP that is not present in the certificate SAN IP list. "
-                    "Production clients validating that IP should fail."
-                )
-        else:
-            if advertised_name not in info.san_dns:
-                log(
-                    "WARNING: advertised TLS name is not present in the certificate SAN DNS list. "
-                    "Production clients validating that hostname should fail."
-                )
 
 
 class CryptoBox:
@@ -462,21 +290,52 @@ class Database:
 
     def _ensure_bootstrap_admin(self) -> None:
         with self.lock, self.conn() as con:
-            row = con.execute(
-                "SELECT id FROM users WHERE nickname = ?", (BOOTSTRAP_ADMIN_USERNAME,)
-            ).fetchone()
-            if row is not None:
-                return
-            if not BOOTSTRAP_ADMIN_PASSWORD or BOOTSTRAP_ADMIN_PASSWORD == "changeme":
+            if not BOOTSTRAP_ADMIN_USERNAME or not BOOTSTRAP_ADMIN_PASSWORD:
+                admin_exists = con.execute("SELECT id FROM users WHERE is_admin = 1 LIMIT 1").fetchone()
+                if admin_exists:
+                    return
                 raise RuntimeError(
-                    "Refusing to auto-provision bootstrap admin with an unsafe default password. "
-                    "Set AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD to a strong secret before starting the server."
+                    "No admin account exists and AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME / "
+                    "AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD are not set. Set them to create the initial admin."
                 )
+
+            if len(BOOTSTRAP_ADMIN_PASSWORD) < 12:
+                raise RuntimeError("Bootstrap admin password must be at least 12 characters.")
+
+            nick_err = validate_nickname(BOOTSTRAP_ADMIN_USERNAME)
+            if nick_err:
+                raise RuntimeError(f"Invalid admin username: {nick_err}")
+
+            existing = con.execute(
+                "SELECT id, is_admin, is_banned FROM users WHERE nickname = ?",
+                (BOOTSTRAP_ADMIN_USERNAME,),
+            ).fetchone()
+            now = int(time.time())
+
+            if existing is not None:
+                updates = []
+                params: list[Any] = []
+                if not bool(existing["is_admin"]):
+                    updates.append("is_admin = 1")
+                if bool(existing["is_banned"]):
+                    updates.append("is_banned = 0")
+                updates.append("password_hash = ?")
+                params.append(pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD))
+                if updates:
+                    params.append(int(existing["id"]))
+                    con.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+                log(f"Bootstrap admin account '{BOOTSTRAP_ADMIN_USERNAME}' enforced on existing user.")
+                return
+
+            admin_exists = con.execute("SELECT id FROM users WHERE is_admin = 1 LIMIT 1").fetchone()
+            if admin_exists:
+                return
+
             con.execute(
                 "INSERT INTO users (nickname, password_hash, reputation, is_admin, is_banned, created_at) VALUES (?, ?, 0, 1, 0, ?)",
-                (BOOTSTRAP_ADMIN_USERNAME, pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD), int(time.time())),
+                (BOOTSTRAP_ADMIN_USERNAME, pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD), now),
             )
-            log("Bootstrap admin account created from operator-supplied secret.")
+            log(f"Bootstrap admin account '{BOOTSTRAP_ADMIN_USERNAME}' created.")
 
     def create_user(self, nickname: str, password: str, contact_info: str) -> tuple[bool, str]:
         with self.lock, self.conn() as con:
@@ -1008,6 +867,8 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
                 "session_token": session.token,
                 "nickname": session.nickname,
                 "reputation": user["reputation"],
+                "is_admin": bool(user["is_admin"]),
+                "is_banned": bool(user["is_banned"]),
             },
             "Login successful.",
         )
@@ -1218,10 +1079,9 @@ class ClientHandler:
 
 
 class Server:
-    def __init__(self, host: str, port: int, ssl_context: ssl.SSLContext) -> None:
+    def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
-        self.ssl_context = ssl_context
         self.sock: Optional[socket.socket] = None
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="afterlife-client")
@@ -1234,7 +1094,7 @@ class Server:
             sock.bind((self.host, self.port))
             sock.listen(MAX_CONNECTIONS)
             self.sock = sock
-            log(f"AFTERLIFE Space TLS server listening on {self.host}:{self.port}")
+            log(f"AFTERLIFE Space server listening on {self.host}:{self.port}")
             while not self.stop_event.is_set():
                 try:
                     client, addr = sock.accept()
@@ -1250,18 +1110,7 @@ class Server:
                             pass
                         continue
                     self.active_connections.add(peer)
-                try:
-                    tls_client = self.ssl_context.wrap_socket(client, server_side=True)
-                except ssl.SSLError as exc:
-                    log(f"TLS handshake failed for {peer}: {exc}")
-                    with self.active_lock:
-                        self.active_connections.discard(peer)
-                    try:
-                        client.close()
-                    except OSError:
-                        pass
-                    continue
-                handler = ClientHandler(tls_client, addr, self.active_connections, self.active_lock)
+                handler = ClientHandler(client, addr, self.active_connections, self.active_lock)
                 self.executor.submit(handler.run)
 
     def stop(self) -> None:
@@ -1274,51 +1123,12 @@ class Server:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 
-def build_server_ssl_context(certfile: str, keyfile: Optional[str]) -> ssl.SSLContext:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = TLS_MIN_VERSION
-    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
-
-    # Conservative hardening for TLS 1.2 suites.
-    # TLS 1.3 suites are managed separately by OpenSSL and are not configured here.
-    try:
-        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:!aNULL:!eNULL:!MD5:!RC4:!3DES:!DES:!EXPORT:!PSK")
-    except ssl.SSLError:
-        pass
-
-    return context
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "AFTERLIFE Space server. TLS is mandatory. Pass --cert with a PEM file containing the server certificate "
-            "and private key, or combine --cert with --key if they are stored separately."
-        )
+        description="AFTERLIFE Space server – plain TCP."
     )
     parser.add_argument("--host", default=HOST, help=f"Bind address (default: {HOST})")
     parser.add_argument("--port", type=int, default=PORT, help=f"Bind port (default: {PORT})")
-    parser.add_argument(
-        "--cert",
-        required=True,
-        help=(
-            "Path to the server PEM certificate. This may be a combined PEM containing both certificate and key. "
-            "The server refuses plaintext transport and will not start without TLS material."
-        ),
-    )
-    parser.add_argument(
-        "--key",
-        default=None,
-        help="Optional private key PEM path when the key is not embedded in --cert.",
-    )
-    parser.add_argument(
-        "--advertised-name",
-        default=None,
-        help=(
-            "Optional hostname or IP that clients are expected to validate. "
-            "Used only for startup certificate SAN warnings."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -1331,24 +1141,7 @@ if __name__ == "__main__":
         log(f"Unable to initialize database/bootstrap state: {exc}")
         raise SystemExit(1)
 
-    cert_path = Path(args.cert)
-    key_path = Path(args.key) if args.key else None
-
-    try:
-        validate_tls_files(cert_path, key_path)
-        cert_info = read_certificate_info(cert_path)
-        startup_log_certificate_info(cert_info, args.advertised_name)
-    except Exception as exc:
-        log(f"Unable to validate TLS certificate material: {exc}")
-        raise SystemExit(1)
-
-    try:
-        ssl_context = build_server_ssl_context(args.cert, args.key)
-    except Exception as exc:
-        log(f"Unable to load TLS certificate material: {exc}")
-        raise SystemExit(1)
-
-    server = Server(args.host, args.port, ssl_context)
+    server = Server(args.host, args.port)
     try:
         server.serve()
     except KeyboardInterrupt:

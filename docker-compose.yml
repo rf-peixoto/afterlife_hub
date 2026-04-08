@@ -10,23 +10,10 @@ services:
       - "${AFTERLIFE_EXPOSE_PORT:-2077}:2077"
 
     volumes:
-      - ./certs:/app/certs
       - ./data:/app/data
 
     environment:
       AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
       AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD}
 
-    command:
-      [
-        "python",
-        "server.py",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "2077",
-        "--cert",
-        "/app/certs/server.crt",
-        "--key",
-        "/app/certs/server.key"
-      ]
+    command: ["python", "server.py", "--host", "0.0.0.0", "--port", "2077"]

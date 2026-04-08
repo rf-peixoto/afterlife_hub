@@ -14,11 +14,11 @@ COPY README.md .
 COPY LICENSE .
 
 RUN useradd -r -u 10001 -m afterlife \
-    && mkdir -p /data /certs \
-    && chown -R afterlife:afterlife /app /data /certs
+    && mkdir -p /data \
+    && chown -R afterlife:afterlife /app /data
 
 USER afterlife
 
-EXPOSE 5050
+EXPOSE 2077
 
-CMD ["python", "server.py"]
+CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "2077"]

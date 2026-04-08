@@ -7,12 +7,10 @@ import ipaddress
 import json
 import os
 import socket
-import ssl
 import sys
 import textwrap
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional
 
 # =========================
@@ -109,60 +107,17 @@ def key_value(label: str, value: str, value_color: str = WHITE) -> None:
 def boot_sequence() -> None:
     steps = [
         "initializing terminal shell...",
-        "loading trusted certificate store...",
-        "preparing tls context...",
-        "establishing encrypted uplink...",
+        "establishing plaintext uplink...",
     ]
     for item in steps:
         print(c(f"> {item}", DIM))
         time.sleep(BOOT_DELAY)
 
 
-def is_ip_address(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
-
-
-def explain_ssl_error(exc: ssl.SSLError) -> str:
-    text = str(exc)
-
-    lowered = text.lower()
-    if "hostname" in lowered or "doesn't match" in lowered or "does not match" in lowered:
-        return (
-            f"{exc}\n"
-            "certificate hostname validation failed. "
-            "the certificate SAN must match the server name used by the client."
-        )
-    if "self-signed certificate" in lowered:
-        return (
-            f"{exc}\n"
-            "the server presented a self-signed certificate that is not trusted by this client. "
-            "use --cert with the issuing CA or the pinned server certificate."
-        )
-    if "unable to get local issuer certificate" in lowered or "unknown ca" in lowered:
-        return (
-            f"{exc}\n"
-            "the client does not trust the certificate chain presented by the server. "
-            "provide the correct CA bundle with --cert."
-        )
-    if "certificate verify failed" in lowered:
-        return (
-            f"{exc}\n"
-            "tls verification failed. confirm that the certificate chain is trusted and "
-            "that the hostname/IP matches the certificate SAN."
-        )
-    return text
-
-
 @dataclass
 class RemoteClient:
     host: str
     port: int
-    ssl_context: ssl.SSLContext
-    server_hostname: str
     session_token: Optional[str] = None
     nickname: Optional[str] = None
     is_admin: bool = False
@@ -173,21 +128,18 @@ class RemoteClient:
 
         raw = json.dumps(payload).encode("utf-8") + b"\n"
 
-        with socket.create_connection((self.host, self.port), timeout=SOCKET_TIMEOUT) as tcp_sock:
-            tcp_sock.settimeout(SOCKET_TIMEOUT)
+        with socket.create_connection((self.host, self.port), timeout=SOCKET_TIMEOUT) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.sendall(raw)
 
-            with self.ssl_context.wrap_socket(tcp_sock, server_hostname=self.server_hostname) as sock:
-                sock.settimeout(SOCKET_TIMEOUT)
-                sock.sendall(raw)
-
-                chunks = b""
-                while not chunks.endswith(b"\n"):
-                    data = sock.recv(4096)
-                    if not data:
-                        break
-                    chunks += data
-                    if len(chunks) > MAX_RESPONSE_BYTES:
-                        raise RuntimeError(f"Server response exceeded {MAX_RESPONSE_BYTES} bytes.")
+            chunks = b""
+            while not chunks.endswith(b"\n"):
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks += data
+                if len(chunks) > MAX_RESPONSE_BYTES:
+                    raise RuntimeError(f"Server response exceeded {MAX_RESPONSE_BYTES} bytes.")
 
         if not chunks:
             raise RuntimeError("No response from server.")
@@ -316,7 +268,7 @@ def print_job_details(data: dict[str, Any]) -> None:
         if workers:
             for worker in workers:
                 marker = c("  << SELECTED >>", GREEN) if data.get("selected_worker_id") == worker["id"] else ""
-                worker_name = f"[banned] {worker["nickname"]}" if worker.get("is_banned") else worker["nickname"]
+                worker_name = f"[banned] {worker['nickname']}" if worker.get("is_banned") else worker["nickname"]
                 worker_color = YELLOW if worker.get("is_banned") else WHITE
                 print(
                     c(f"  [{worker['id']}] ", MAGENTA)
@@ -329,59 +281,9 @@ def print_job_details(data: dict[str, Any]) -> None:
             print(c("  no workers assigned yet.", DIM))
 
 
-def build_ssl_context(cert_path: str | None = None, insecure: bool = False) -> ssl.SSLContext:
-    """
-    Secure mode:
-      - certificate verification required
-      - hostname verification required
-
-    Insecure mode:
-      - certificate verification disabled
-      - hostname verification disabled
-      - testing only
-    """
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-
-    if insecure:
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
-
-    context.verify_mode = ssl.CERT_REQUIRED
-    context.check_hostname = True
-
-    if cert_path:
-        context.load_verify_locations(cafile=cert_path)
-
-    return context
-
-
-def validate_args(args: argparse.Namespace) -> None:
-    if not args.insecure:
-        if not args.cert:
-            raise SystemExit("secure mode requires --cert pointing to a trusted PEM CA bundle or pinned server certificate")
-        cert_file = Path(args.cert)
-        if not cert_file.is_file():
-            raise SystemExit(f"trusted PEM file not found: {args.cert}")
-
-    if args.port < 1 or args.port > 65535:
-        raise SystemExit("port must be between 1 and 65535")
-
-
 def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     clear()
-    subtitle = "tls verification enabled" if not args.insecure else "WARNING: insecure testing mode"
-    section("NODE LINK // TLS REQUIRED", subtitle)
-
-    key_value("Trust PEM", args.cert if args.cert else "(system/default)", CYAN)
-    if args.server_name:
-        key_value("TLS Name", args.server_name, CYAN)
-    print()
-
-    if args.insecure:
-        print(c("[ WARNING ] --insecure disables certificate and hostname verification. testing only.", YELLOW + BOLD))
-        print(line("·"))
+    section("NODE LINK // PLAIN TCP", "no encryption – use in trusted networks only")
 
     boot_sequence()
     print(line("·"))
@@ -394,38 +296,14 @@ def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     except ValueError:
         port = args.port
 
-    server_name = args.server_name or host
-
-    if not args.insecure and is_ip_address(host) and not args.server_name:
-        print(c(
-            "[ NOTICE ] you are connecting to a raw IP without --server-name.\n"
-            "production certificates often validate against a DNS name. this only works if the certificate SAN includes that IP.",
-            YELLOW,
-        ))
-        print(line("·"))
-
-    client = RemoteClient(
-        host=host,
-        port=port,
-        ssl_context=build_ssl_context(args.cert, insecure=args.insecure),
-        server_hostname=server_name,
-    )
+    client = RemoteClient(host=host, port=port)
 
     try:
         if client.ping():
-            print(c("[ LINK UP ] encrypted session established.", GREEN))
+            print(c("[ LINK UP ] connection established.", GREEN))
             key_value("Remote", f"{host}:{port}", CYAN)
-            key_value("TLS peer", server_name, CYAN)
         else:
             print(c("[ LINK ERROR ] server responded unexpectedly.", RED))
-    except ssl.SSLCertVerificationError as exc:
-        print(c("[ TLS FAILURE ] certificate verification error", RED + BOLD))
-        print(c(wrap(explain_ssl_error(exc)), RED))
-        sys.exit(1)
-    except ssl.SSLError as exc:
-        print(c("[ TLS FAILURE ] ssl error", RED + BOLD))
-        print(c(wrap(explain_ssl_error(exc)), RED))
-        sys.exit(1)
     except Exception as exc:
         print(c(f"[ CONNECTION FAILURE ] {exc}", RED))
         sys.exit(1)
@@ -455,6 +333,10 @@ def auth_menu(client: RemoteClient) -> None:
                 client.session_token = data.get("session_token")
                 client.nickname = data.get("nickname")
                 client.is_admin = bool(data.get("is_admin"))
+                if client.session_token and client.nickname and not client.is_admin:
+                    profile = client.request({"action": "profile"})
+                    if profile.get("ok"):
+                        client.is_admin = bool(profile.get("data", {}).get("is_admin"))
                 time.sleep(0.6)
             else:
                 pause()
@@ -656,7 +538,6 @@ def my_accepts_menu(client: RemoteClient) -> None:
     pause()
 
 
-
 def ban_user_menu(client: RemoteClient) -> None:
     clear()
     section("ADMIN BAN // PERMANENT ACTION")
@@ -746,38 +627,11 @@ def main_menu(client: RemoteClient) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "AFTERLIFE client terminal. TLS is mandatory for production. "
-            "Use --cert to point to the trusted PEM CA bundle or pinned server certificate. "
-            "--insecure disables certificate and hostname verification and must only be used for testing."
-        )
+        description="AFTERLIFE client – plain TCP terminal interface."
     )
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Default server host/IP (default: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Default server port (default: {DEFAULT_PORT})")
-    parser.add_argument(
-        "--cert",
-        default=None,
-        help=(
-            "Path to the trusted PEM CA bundle or pinned server certificate. "
-            "Required in secure mode."
-        ),
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Disable TLS certificate and hostname verification (testing only).",
-    )
-    parser.add_argument(
-        "--server-name",
-        default=None,
-        help=(
-            "Optional TLS server name override for certificate matching/SNI. "
-            "Useful when connecting to a raw IP but validating a DNS certificate."
-        ),
-    )
-    args = parser.parse_args()
-    validate_args(args)
-    return args
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Server host/IP (default: {DEFAULT_HOST})")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
+    return parser.parse_args()
 
 
 def main() -> None:
