@@ -8,7 +8,11 @@ ENV_FILE="./.env"
 CLIENT_CERT_EXPORT="./server.crt"
 DEFAULT_PORT="2077"
 CERT_VALID_DAYS="36500"
-CERT_CN="afterlife.hub"
+CERT_CN="localhost"
+CERT_SAN_DNS_DEFAULT="localhost,afterlife.hub"
+CERT_SAN_IPS_DEFAULT="127.0.0.1,::1"
+CERT_SAN_DNS=""
+CERT_SAN_IPS=""
 DEFAULT_CONTAINER_NAME="afterlife-server"
 STARTUP_WAIT_SECONDS="6"
 HEALTHCHECK_LOG_TAIL="30"
@@ -23,6 +27,8 @@ ADMIN_USER=""
 ADMIN_PASS=""
 EXPOSE_PORT=""
 CONTAINER_NAME="${DEFAULT_CONTAINER_NAME}"
+EXTRA_SAN_DNS=""
+EXTRA_SAN_IPS=""
 
 banner() {
     echo -e "${CYAN}========================================${RESET}"
@@ -66,6 +72,7 @@ require_cmd() {
 check_dependencies() {
     require_cmd docker
     require_cmd openssl
+    require_cmd python3
     require_cmd sudo
     require_cmd awk
     require_cmd grep
@@ -93,9 +100,143 @@ validate_password() {
     (( ${#pass} >= 12 )) || fail "Admin password must be at least 12 characters."
 }
 
+trim() {
+    local s="$*"
+    s="${s#${s%%[![:space:]]*}}"
+    s="${s%${s##*[![:space:]]}}"
+    printf '%s' "$s"
+}
+
+unique_csv_append() {
+    local current="$1"
+    local value="$2"
+    local item
+
+    value="$(trim "$value")"
+    [[ -n "$value" ]] || { printf '%s' "$current"; return; }
+
+    IFS=',' read -r -a items <<< "$current"
+    for item in "${items[@]}"; do
+        item="$(trim "$item")"
+        [[ "$item" == "$value" ]] && { printf '%s' "$current"; return; }
+    done
+
+    if [[ -z "$current" ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s,%s' "$current" "$value"
+    fi
+}
+
+normalize_csv() {
+    local input="$1"
+    local output=""
+    local part
+
+    IFS=',' read -r -a parts <<< "$input"
+    for part in "${parts[@]}"; do
+        part="$(trim "$part")"
+        [[ -n "$part" ]] || continue
+        output="$(unique_csv_append "$output" "$part")"
+    done
+
+    printf '%s' "$output"
+}
+
+looks_like_ip() {
+    local value="$1"
+    [[ "$value" == *:* ]] && return 0
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+validate_dns_name() {
+    local name="$1"
+    [[ ${#name} -le 253 ]] || return 1
+    [[ "$name" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$name" != .* ]] || return 1
+    [[ "$name" != *. ]] || return 1
+    [[ "$name" != *..* ]] || return 1
+    return 0
+}
+
+validate_ip_value() {
+    local value="$1"
+    python3 - <<'PY' "$value"
+import ipaddress
+import sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
+validate_csv_dns() {
+    local input="$1"
+    local part
+    [[ -z "$input" ]] && return 0
+    IFS=',' read -r -a parts <<< "$input"
+    for part in "${parts[@]}"; do
+        part="$(trim "$part")"
+        [[ -n "$part" ]] || continue
+        validate_dns_name "$part" || fail "Invalid DNS SAN entry: $part"
+    done
+}
+
+validate_csv_ips() {
+    local input="$1"
+    local part
+    [[ -z "$input" ]] && return 0
+    IFS=',' read -r -a parts <<< "$input"
+    for part in "${parts[@]}"; do
+        part="$(trim "$part")"
+        [[ -n "$part" ]] || continue
+        validate_ip_value "$part" || fail "Invalid IP SAN entry: $part"
+    done
+}
+
+autodetect_san_candidates() {
+    local detected_dns=""
+    local detected_ips=""
+    local host_short host_fqdn ip
+
+    host_short="$(hostname 2>/dev/null || true)"
+    host_fqdn="$(hostname -f 2>/dev/null || true)"
+
+    if [[ -n "$host_short" && "$host_short" != "localhost" ]]; then
+        detected_dns="$(unique_csv_append "$detected_dns" "$host_short")"
+    fi
+    if [[ -n "$host_fqdn" && "$host_fqdn" != "localhost" ]]; then
+        detected_dns="$(unique_csv_append "$detected_dns" "$host_fqdn")"
+    fi
+
+    while IFS= read -r ip; do
+        ip="$(trim "$ip")"
+        [[ -n "$ip" ]] || continue
+        [[ "$ip" == 127.* ]] && continue
+        [[ "$ip" == "::1" ]] && continue
+        detected_ips="$(unique_csv_append "$detected_ips" "$ip")"
+    done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+
+    EXTRA_SAN_DNS="$detected_dns"
+    EXTRA_SAN_IPS="$detected_ips"
+}
+
+build_final_san_lists() {
+    CERT_SAN_DNS="$(normalize_csv "${CERT_SAN_DNS_DEFAULT},${EXTRA_SAN_DNS}")"
+    CERT_SAN_IPS="$(normalize_csv "${CERT_SAN_IPS_DEFAULT},${EXTRA_SAN_IPS}")"
+}
+
 prompt_inputs() {
+    autodetect_san_candidates
+    build_final_san_lists
+
     echo -e "${CYAN}This will bootstrap AFTERLIFE with pinned self-signed TLS.${RESET}"
-    echo -e "${CYAN}Certificate CN: ${CERT_CN}${RESET}"
+    echo -e "${CYAN}Certificate CN default: ${CERT_CN}${RESET}"
+    echo -e "${CYAN}Default SAN DNS: ${CERT_SAN_DNS_DEFAULT}${RESET}"
+    echo -e "${CYAN}Default SAN IPs: ${CERT_SAN_IPS_DEFAULT}${RESET}"
+    [[ -n "$EXTRA_SAN_DNS" ]] && echo -e "${CYAN}Auto-detected extra DNS SANs: ${EXTRA_SAN_DNS}${RESET}"
+    [[ -n "$EXTRA_SAN_IPS" ]] && echo -e "${CYAN}Auto-detected extra IP SANs: ${EXTRA_SAN_IPS}${RESET}"
     echo
 
     read -rp "Admin username: " ADMIN_USER
@@ -111,6 +252,32 @@ prompt_inputs() {
 
     read -rp "Docker container name [${DEFAULT_CONTAINER_NAME}]: " CONTAINER_NAME
     CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
+
+    echo
+    read -rp "TLS certificate common name/CN [${CERT_CN}]: " cert_cn_input
+    CERT_CN="${cert_cn_input:-$CERT_CN}"
+    validate_dns_name "$CERT_CN" || fail "Certificate CN must be a valid DNS name."
+
+    read -rp "Extra DNS names for SAN (comma-separated) [${EXTRA_SAN_DNS}]: " dns_input
+    EXTRA_SAN_DNS="${dns_input:-$EXTRA_SAN_DNS}"
+    EXTRA_SAN_DNS="$(normalize_csv "$EXTRA_SAN_DNS")"
+    validate_csv_dns "$EXTRA_SAN_DNS"
+
+    read -rp "Extra IPs for SAN (comma-separated) [${EXTRA_SAN_IPS}]: " ips_input
+    EXTRA_SAN_IPS="${ips_input:-$EXTRA_SAN_IPS}"
+    EXTRA_SAN_IPS="$(normalize_csv "$EXTRA_SAN_IPS")"
+    validate_csv_ips "$EXTRA_SAN_IPS"
+
+    if looks_like_ip "$CERT_CN"; then
+        fail "Certificate CN should be a hostname, not an IP. Put IPs in SAN instead."
+    fi
+
+    build_final_san_lists
+
+    echo
+    info "Final certificate CN: ${CERT_CN}"
+    info "Final certificate SAN DNS: ${CERT_SAN_DNS}"
+    info "Final certificate SAN IPs: ${CERT_SAN_IPS}"
 }
 
 prepare_folders() {
@@ -130,7 +297,8 @@ generate_tls_material() {
             -days "$CERT_VALID_DAYS" \
             -keyout "$key_path" \
             -out "$cert_path" \
-            -subj "/CN=${CERT_CN}" >/dev/null 2>&1
+            -subj "/CN=${CERT_CN}" \
+            -addext "subjectAltName=DNS:${CERT_SAN_DNS//,/\,DNS:},IP:${CERT_SAN_IPS//,/\,IP:}" >/dev/null 2>&1
         success "TLS certificate generated."
     fi
 
@@ -141,22 +309,31 @@ generate_tls_material() {
 
 write_env() {
     info "Writing ${ENV_FILE} ..."
-    cat > "$ENV_FILE" <<EOF
-AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=${ADMIN_USER}
-AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD=${ADMIN_PASS}
-AFTERLIFE_EXPOSE_PORT=${EXPOSE_PORT}
-AFTERLIFE_DB_PATH=/app/data/AFTERLIFE_space.db
-AFTERLIFE_MASTER_KEY_PATH=/app/data/master.key
-AFTERLIFE_LOG_PATH=/app/data/server.log
-AFTERLIFE_TLS_CERT_PATH=/app/data/certs/server.crt
-AFTERLIFE_TLS_KEY_PATH=/app/data/certs/server.key
-EOF
+    : > "$ENV_FILE"
+    {
+        printf 'AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=%s
+' "$ADMIN_USER"
+        printf 'AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD=%s
+' "$ADMIN_PASS"
+        printf 'AFTERLIFE_EXPOSE_PORT=%s
+' "$EXPOSE_PORT"
+        printf 'AFTERLIFE_DB_PATH=%s
+' '/app/data/AFTERLIFE_space.db'
+        printf 'AFTERLIFE_MASTER_KEY_PATH=%s
+' '/app/data/master.key'
+        printf 'AFTERLIFE_LOG_PATH=%s
+' '/app/data/server.log'
+        printf 'AFTERLIFE_TLS_CERT_PATH=%s
+' '/app/data/certs/server.crt'
+        printf 'AFTERLIFE_TLS_KEY_PATH=%s
+' '/app/data/certs/server.key'
+    } > "$ENV_FILE"
     chmod 600 "$ENV_FILE" || true
 }
 
 apply_bootstrap_permissions() {
     info "Applying bootstrap permissions..."
-    sudo chmod 777 "$DATA_DIR"
+    sudo chmod 700 "$DATA_DIR"
     sudo chmod 755 "$CERTS_DIR"
     sudo chmod 644 "${CERTS_DIR}/server.crt"
     sudo chmod 600 "${CERTS_DIR}/server.key"
@@ -255,7 +432,7 @@ apply_runtime_permissions() {
     info "Applying runtime ownership and permissions for UID:GID ${uid}:${gid} ..."
 
     sudo chown -R "${uid}:${gid}" "$DATA_DIR"
-    sudo chmod 755 "$DATA_DIR"
+    sudo chmod 700 "$DATA_DIR"
     sudo chmod 755 "$CERTS_DIR"
     sudo chmod 644 "${CERTS_DIR}/server.crt"
     sudo chmod 600 "${CERTS_DIR}/server.key"
@@ -277,12 +454,13 @@ logs_show_listening_recent() {
     docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>&1 | grep -q "AFTERLIFE Space server listening with TLS"
 }
 
-recover_with_permissive_data_dir() {
-    warn "Detected persistent permission failure. Applying recovery permissions..."
-    sudo chmod 777 "$DATA_DIR"
-    sudo chmod 755 "$CERTS_DIR"
-    sudo chmod 644 "${CERTS_DIR}/server.crt"
-    sudo chmod 600 "${CERTS_DIR}/server.key"
+recover_with_runtime_permissions() {
+    local uidgid="${1:-}"
+    if [[ -z "$uidgid" ]]; then
+        uidgid="$(detect_uid_gid_from_container)"
+    fi
+    warn "Detected persistent permission failure. Re-applying ownership and strict permissions..."
+    apply_runtime_permissions "$uidgid"
     restart_stack
     wait_for_container
 }
@@ -295,6 +473,9 @@ show_diagnostics() {
     echo "Detected UID:GID : $(detect_uid_gid_from_container || true)"
     echo "Data dir         : $(realpath "$DATA_DIR" 2>/dev/null || echo "$DATA_DIR")"
     echo "Server cert      : $(realpath "$CLIENT_CERT_EXPORT" 2>/dev/null || echo "$CLIENT_CERT_EXPORT")"
+    echo "Cert CN          : ${CERT_CN}"
+    echo "Cert SAN DNS     : ${CERT_SAN_DNS}"
+    echo "Cert SAN IPs     : ${CERT_SAN_IPS}"
     echo
     echo "Host permissions:"
     ls -ld "$DATA_DIR" "$CERTS_DIR" || true
@@ -313,6 +494,9 @@ show_summary() {
     echo "Exposed port   : ${EXPOSE_PORT}"
     echo "Container name : ${CONTAINER_NAME}"
     echo "Server cert    : ${CLIENT_CERT_EXPORT}"
+    echo "Cert CN        : ${CERT_CN}"
+    echo "Cert SAN DNS   : ${CERT_SAN_DNS}"
+    echo "Cert SAN IPs   : ${CERT_SAN_IPS}"
     echo
     echo "Client command:"
     echo "  python3 client.py --host YOUR_SERVER_IP --port ${EXPOSE_PORT} --cert ./server.crt"
@@ -329,6 +513,10 @@ show_summary() {
 }
 
 main() {
+    if [[ $# -gt 0 ]]; then
+        warn "Ignoring unexpected positional arguments: $*"
+    fi
+
     banner
     check_dependencies
     prompt_inputs
@@ -351,7 +539,7 @@ main() {
 
     if logs_show_masterkey_permission_error_recent || logs_show_tls_permission_error_recent; then
         warn "Recent logs still show permission problems after runtime permission fix."
-        recover_with_permissive_data_dir
+        recover_with_runtime_permissions
     fi
 
     if logs_show_listening_recent; then
