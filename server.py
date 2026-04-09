@@ -73,14 +73,57 @@ BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
 print_lock = threading.Lock()
 
 
+def sanitize_log_value(value: Any) -> str:
+    text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = "".join(ch for ch in text if ch.isprintable())
+    for ch in ("'", '"', "%", "|", "+"):
+        text = text.replace(ch, "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}\n"
+    safe_message = sanitize_log_value(message)
+    line = f"[{timestamp}] {safe_message}\n"
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(line)
     with print_lock:
         print(line, end="")
+
+
+def audit_log(
+    event: str,
+    *,
+    ip: Optional[str] = None,
+    actor_nickname: Optional[str] = None,
+    action: Optional[str] = None,
+    target_user: Optional[str] = None,
+    job_id: Optional[int] = None,
+    status: str = "INFO",
+    details: Optional[str] = None,
+) -> None:
+    parts = [
+        f"event={sanitize_log_value(event)}",
+        f"status={sanitize_log_value(status)}",
+    ]
+
+    if action is not None:
+        parts.append(f"action={sanitize_log_value(action)}")
+    if ip is not None:
+        parts.append(f"ip={sanitize_log_value(ip)}")
+    if actor_nickname:
+        parts.append(f"actor={sanitize_log_value(actor_nickname)}")
+    if target_user:
+        parts.append(f"target_user={sanitize_log_value(target_user)}")
+    if job_id is not None:
+        parts.append(f"job_id={job_id}")
+    if details:
+        parts.append(f"details={sanitize_log_value(details)}")
+
+    log(" ".join(parts))
 
 
 def pbkdf2_hash(value: str, salt: Optional[bytes] = None) -> str:
@@ -324,7 +367,7 @@ class Database:
                 if updates:
                     params.append(int(existing["id"]))
                     con.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
-                log(f"Bootstrap admin account '{BOOTSTRAP_ADMIN_USERNAME}' enforced on existing user.")
+                log(f"Bootstrap admin account {BOOTSTRAP_ADMIN_USERNAME} enforced on existing user.")
                 return
 
             admin_exists = con.execute("SELECT id FROM users WHERE is_admin = 1 LIMIT 1").fetchone()
@@ -335,7 +378,7 @@ class Database:
                 "INSERT INTO users (nickname, password_hash, reputation, is_admin, is_banned, created_at) VALUES (?, ?, 0, 1, 0, ?)",
                 (BOOTSTRAP_ADMIN_USERNAME, pbkdf2_hash(BOOTSTRAP_ADMIN_PASSWORD), now),
             )
-            log(f"Bootstrap admin account '{BOOTSTRAP_ADMIN_USERNAME}' created.")
+            log(f"Bootstrap admin account {BOOTSTRAP_ADMIN_USERNAME} created.")
 
     def create_user(self, nickname: str, password: str, contact_info: str) -> tuple[bool, str]:
         with self.lock, self.conn() as con:
@@ -376,7 +419,7 @@ class Database:
 
     def ban_user(self, actor_id: int, nickname: str) -> tuple[bool, str, Optional[int]]:
         with self.lock, self.conn() as con:
-            actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
+            actor = con.execute("SELECT id, is_admin, nickname FROM users WHERE id = ?", (actor_id,)).fetchone()
             if actor is None or not bool(actor["is_admin"]):
                 return False, "Not allowed.", None
             target = con.execute("SELECT id, nickname, is_admin, is_banned FROM users WHERE nickname = ?", (nickname,)).fetchone()
@@ -823,15 +866,42 @@ def require_session(request: dict[str, Any]) -> tuple[Optional[Session], Optiona
 def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
     shape_problem = ensure_request_shape(request)
     if shape_problem:
+        audit_log(
+            event="request_rejected",
+            action="invalid_shape",
+            ip=ip,
+            status="fail",
+            details=shape_problem,
+        )
         return err(shape_problem, "bad_request")
 
     action = request.get("action")
     if not isinstance(action, str):
+        audit_log(
+            event="request_rejected",
+            action="missing_action",
+            ip=ip,
+            status="fail",
+            details="Missing action.",
+        )
         return err("Missing action.", "bad_request")
     if action not in VALID_ACTIONS:
+        audit_log(
+            event="request_rejected",
+            action=str(action),
+            ip=ip,
+            status="fail",
+            details="Unknown action.",
+        )
         return err("Unknown action.", "unknown_action")
 
     if action == "ping":
+        audit_log(
+            event="request",
+            action=action,
+            ip=ip,
+            status="success",
+        )
         return ok({"server": "AFTERLIFE-space", "version": 2}, "pong")
 
     if action == "register":
@@ -840,8 +910,24 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         contact_info = str(request.get("contact_info", "")).strip()
         problem = validate_nickname(nickname) or validate_password(password) or validate_contact_info(contact_info)
         if problem:
+            audit_log(
+                event="user_register",
+                action=action,
+                ip=ip,
+                actor_nickname=nickname or None,
+                status="fail",
+                details=problem,
+            )
             return err(problem, "validation_error")
         success, message = db.create_user(nickname, password, contact_info)
+        audit_log(
+            event="user_register",
+            action=action,
+            ip=ip,
+            actor_nickname=nickname,
+            status="success" if success else "fail",
+            details=message,
+        )
         return ok(message=message) if success else err(message, "register_failed")
 
     if action == "login":
@@ -849,19 +935,50 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         password = str(request.get("password", ""))
         allowed_login, retry = login_throttle.check(ip, nickname)
         if not allowed_login:
+            audit_log(
+                event="login_throttled",
+                action=action,
+                ip=ip,
+                actor_nickname=nickname or None,
+                status="blocked",
+                details=f"retry_after={retry}s",
+            )
             return err("Login temporarily blocked for this nickname from your address.", "login_throttled", retry)
         known_user = db.get_user_by_nickname(nickname)
         if known_user is not None and bool(known_user["is_banned"]):
             login_throttle.fail(ip, nickname)
             time.sleep(1.0)
+            audit_log(
+                event="login_denied_banned",
+                action=action,
+                ip=ip,
+                actor_nickname=nickname,
+                status="denied",
+                details="account banned",
+            )
             return err("This account is banned.", "account_banned")
         user = db.authenticate(nickname, password)
         if not user:
             login_throttle.fail(ip, nickname)
             time.sleep(1.0)
+            audit_log(
+                event="login_failed",
+                action=action,
+                ip=ip,
+                actor_nickname=nickname or None,
+                status="fail",
+                details="invalid credentials",
+            )
             return err("Invalid credentials.", "login_failed")
         login_throttle.success(ip, nickname)
         session = sessions.create(user)
+        audit_log(
+            event="login_success",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            status="success",
+        )
         return ok(
             {
                 "session_token": session.token,
@@ -874,16 +991,55 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         )
 
     if action == "logout":
+        session = sessions.get(request.get("session_token"))
+        if session:
+            audit_log(
+                event="logout",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="success",
+            )
+        else:
+            audit_log(
+                event="logout",
+                action=action,
+                ip=ip,
+                status="success",
+                details="no active session",
+            )
         sessions.delete(request.get("session_token"))
         return ok(message="Logged out.")
 
     if action == "profile":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="profile_view",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         user = db.get_user(session.user_id)
         if user is None:
+            audit_log(
+                event="profile_view",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details="User not found.",
+            )
             return err("User not found.", "not_found")
+        audit_log(
+            event="profile_view",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            status="success",
+        )
         return ok(
             {
                 "nickname": user["nickname"],
@@ -898,24 +1054,73 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
     if action == "list_jobs":
         status = request.get("status")
         if status is not None and status not in {"open", "done", "cancelled"}:
+            audit_log(
+                event="jobs_list",
+                action=action,
+                ip=ip,
+                status="fail",
+                details="Invalid status filter.",
+            )
             return err("Invalid status filter.", "validation_error")
+        audit_log(
+            event="jobs_list",
+            action=action,
+            ip=ip,
+            status="success",
+            details=f"status_filter={status}" if status is not None else "status_filter=all",
+        )
         return ok({"jobs": db.list_jobs(status=status)})
 
     if action == "my_jobs":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="my_jobs_view",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
+        audit_log(
+            event="my_jobs_view",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            status="success",
+        )
         return ok({"jobs": db.my_authored_jobs(session.user_id)})
 
     if action == "my_accepts":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="my_accepts_view",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
+        audit_log(
+            event="my_accepts_view",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            status="success",
+        )
         return ok({"jobs": db.my_accepted_jobs(session.user_id)})
 
     if action == "create_job":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="job_create",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         title = str(request.get("title", "")).strip()
         description = str(request.get("description", "")).strip()
@@ -923,8 +1128,25 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         is_private, bool_problem = parse_bool_field(request.get("is_private", False), "is_private")
         problem = validate_title(title) or validate_description(description) or validate_reward(reward_raw) or bool_problem
         if problem:
+            audit_log(
+                event="job_create",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details=problem,
+            )
             return err(problem, "validation_error")
         result = db.create_job(session.user_id, title, description, int(reward_raw), bool(is_private))
+        audit_log(
+            event="job_create",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            job_id=result["job_id"],
+            status="success",
+            details=f"reward={reward_raw} private={bool(is_private)}",
+        )
         return ok(result, "Job created.")
 
     if action == "job_details":
@@ -933,84 +1155,266 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         try:
             job_id_int = int(job_id)
         except Exception:
+            audit_log(
+                event="job_view",
+                action=action,
+                ip=ip,
+                status="fail",
+                details="Invalid job id.",
+            )
             return err("Invalid job id.", "validation_error")
         session = sessions.get(request.get("session_token"))
         viewer_id = session.user_id if session else None
         success, message, data = db.get_job_for_viewer(job_id_int, viewer_id, str(unlock_token) if unlock_token else None)
+        audit_log(
+            event="job_view",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname if session else None,
+            job_id=job_id_int,
+            status="success" if success and data is not None else "fail",
+            details=f"unlock_token={'yes' if unlock_token else 'no'} {message}",
+        )
         return ok(data, message) if success and data is not None else err(message, "not_found")
 
     if action == "accept_job":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="job_accept",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         try:
             job_id = int(request.get("job_id"))
         except Exception:
+            audit_log(
+                event="job_accept",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details="Invalid job id.",
+            )
             return err("Invalid job id.", "validation_error")
         success, message = db.accept_job(job_id, session.user_id)
+        audit_log(
+            event="job_accept",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            job_id=job_id,
+            status="success" if success else "fail",
+            details=message,
+        )
         return ok(message=message) if success else err(message, "accept_failed")
 
     if action == "withdraw_job":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="job_withdraw",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         try:
             job_id = int(request.get("job_id"))
         except Exception:
+            audit_log(
+                event="job_withdraw",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details="Invalid job id.",
+            )
             return err("Invalid job id.", "validation_error")
         success, message = db.withdraw_accept(job_id, session.user_id)
+        audit_log(
+            event="job_withdraw",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            job_id=job_id,
+            status="success" if success else "fail",
+            details=message,
+        )
         return ok(message=message) if success else err(message, "withdraw_failed")
 
     if action == "select_worker":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="job_select_worker",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         try:
             job_id = int(request.get("job_id"))
             worker_id = int(request.get("worker_id"))
         except Exception:
+            audit_log(
+                event="job_select_worker",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details="Invalid identifiers.",
+            )
             return err("Invalid identifiers.", "validation_error")
+        worker = db.get_user(worker_id)
         success, message = db.set_selected_worker(job_id, session.user_id, worker_id)
+        audit_log(
+            event="job_select_worker",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            target_user=str(worker["nickname"]) if worker is not None else None,
+            job_id=job_id,
+            status="success" if success else "fail",
+            details=message,
+        )
         return ok(message=message) if success else err(message, "select_failed")
 
     if action == "set_status":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="job_status_change",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         try:
             job_id = int(request.get("job_id"))
         except Exception:
+            audit_log(
+                event="job_status_change",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details="Invalid job id.",
+            )
             return err("Invalid job id.", "validation_error")
         status = str(request.get("status", "")).strip().lower()
         success, message = db.set_job_status(job_id, session.user_id, status)
+        audit_log(
+            event="job_status_change",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            job_id=job_id,
+            status="success" if success else "fail",
+            details=f"new_status={status} {message}",
+        )
         return ok(message=message) if success else err(message, "status_failed")
 
     if action == "delete_job":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="job_delete",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         try:
             job_id = int(request.get("job_id"))
         except Exception:
+            audit_log(
+                event="job_delete",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                status="fail",
+                details="Invalid job id.",
+            )
             return err("Invalid job id.", "validation_error")
         success, message = db.delete_job(session.user_id, job_id)
+        audit_log(
+            event="job_delete",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            job_id=job_id,
+            status="success" if success else "fail",
+            details=message,
+        )
         return ok(message=message) if success else err(message, "delete_failed")
 
     if action == "ban_user":
         session, failure = require_session(request)
         if failure:
+            audit_log(
+                event="user_ban",
+                action=action,
+                ip=ip,
+                status="fail",
+                details=failure["message"],
+            )
             return failure
         nickname = str(request.get("nickname", "")).strip()
         problem = validate_nickname(nickname)
         if problem:
+            audit_log(
+                event="user_ban",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                target_user=nickname or None,
+                status="fail",
+                details=problem,
+            )
             return err(problem, "validation_error")
         success, message, banned_user_id = db.ban_user(session.user_id, nickname)
         if success and banned_user_id is not None:
             sessions.delete_user_sessions(banned_user_id)
+            audit_log(
+                event="user_ban",
+                action=action,
+                ip=ip,
+                actor_nickname=session.nickname,
+                target_user=nickname,
+                status="success",
+                details=message,
+            )
             return ok(message=message)
+        audit_log(
+            event="user_ban",
+            action=action,
+            ip=ip,
+            actor_nickname=session.nickname,
+            target_user=nickname,
+            status="fail",
+            details=message,
+        )
         return err(message, "ban_failed")
 
+    audit_log(
+        event="request_rejected",
+        action=str(action),
+        ip=ip,
+        status="fail",
+        details="Unknown action.",
+    )
     return err("Unknown action.", "unknown_action")
+
+
+
 
 
 class ClientHandler:
@@ -1030,6 +1434,13 @@ class ClientHandler:
             while True:
                 allowed, retry = global_limiter.allow(ip)
                 if not allowed:
+                    audit_log(
+                        event="rate_limited",
+                        action="request",
+                        ip=ip,
+                        status="blocked",
+                        details=f"retry_after={retry}s",
+                    )
                     response = err("Too many requests. Slow down.", "rate_limited", retry)
                     file.write((json.dumps(response) + "\n").encode("utf-8"))
                     file.flush()
@@ -1039,11 +1450,25 @@ class ClientHandler:
                 if not line:
                     break
                 if len(line) > MAX_REQUEST_LINE_BYTES and not line.endswith(b"\n"):
+                    audit_log(
+                        event="request_too_large",
+                        action="request",
+                        ip=ip,
+                        status="fail",
+                        details=f"limit={MAX_REQUEST_LINE_BYTES}",
+                    )
                     response = err(f"Request line exceeds {MAX_REQUEST_LINE_BYTES} bytes.", "request_too_large")
                     file.write((json.dumps(response) + "\n").encode("utf-8"))
                     file.flush()
                     break
                 if len(line) > MAX_REQUEST_LINE_BYTES:
+                    audit_log(
+                        event="request_too_large",
+                        action="request",
+                        ip=ip,
+                        status="fail",
+                        details=f"limit={MAX_REQUEST_LINE_BYTES}",
+                    )
                     response = err(f"Request line exceeds {MAX_REQUEST_LINE_BYTES} bytes.", "request_too_large")
                     file.write((json.dumps(response) + "\n").encode("utf-8"))
                     file.flush()
@@ -1052,6 +1477,13 @@ class ClientHandler:
                     request = json.loads(line.decode("utf-8"))
                 except Exception:
                     allowed_parse, retry_parse = parse_error_limiter.allow(ip)
+                    audit_log(
+                        event="bad_json",
+                        action="request",
+                        ip=ip,
+                        status="fail" if allowed_parse else "blocked",
+                        details="Invalid JSON.",
+                    )
                     response = err("Invalid JSON.", "bad_json", None if allowed_parse else retry_parse)
                     file.write((json.dumps(response) + "\n").encode("utf-8"))
                     file.flush()
@@ -1100,6 +1532,7 @@ class Server:
                     client, addr = sock.accept()
                 except OSError:
                     break
+
                 peer = f"{addr[0]}:{addr[1]}" if addr else "unknown"
                 with self.active_lock:
                     if len(self.active_connections) >= MAX_CONNECTIONS:
@@ -1125,7 +1558,7 @@ class Server:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="AFTERLIFE Space server – plain TCP."
+        description="AFTERLIFE Space server - plain TCP socket server."
     )
     parser.add_argument("--host", default=HOST, help=f"Bind address (default: {HOST})")
     parser.add_argument("--port", type=int, default=PORT, help=f"Bind port (default: {PORT})")
