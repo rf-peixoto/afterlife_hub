@@ -67,6 +67,12 @@ BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME")
 BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
 
 
+def clear_bootstrap_admin_password() -> None:
+    global BOOTSTRAP_ADMIN_PASSWORD
+    os.environ.pop("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD", None)
+    BOOTSTRAP_ADMIN_PASSWORD = None
+
+
 # =========================
 # Utilities
 # =========================
@@ -271,6 +277,7 @@ class Database:
         self.lock = threading.RLock()
         self._init_db()
         self._ensure_bootstrap_admin()
+        clear_bootstrap_admin_password()
 
     def conn(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, check_same_thread=False)
@@ -720,6 +727,9 @@ class SessionStore:
             last_seen=time.time(),
         )
         with self.lock:
+            doomed = [existing for existing, current in self.sessions.items() if current.user_id == session.user_id]
+            for existing in doomed:
+                self.sessions.pop(existing, None)
             self.sessions[token] = session
         return session
 
@@ -756,14 +766,25 @@ class SlidingWindowLimiter:
         self.lock = threading.Lock()
         self.hits: dict[str, list[float]] = {}
 
+    def _cleanup_bucket(self, key: str, now: float) -> list[float]:
+        bucket = self.hits.get(key)
+        if bucket is None:
+            bucket = []
+            self.hits[key] = bucket
+        bucket[:] = [ts for ts in bucket if now - ts < self.window_seconds]
+        if not bucket:
+            self.hits.pop(key, None)
+            return []
+        return bucket
+
     def allow(self, key: str) -> tuple[bool, int]:
         now = time.time()
         with self.lock:
-            bucket = self.hits.setdefault(key, [])
-            bucket[:] = [ts for ts in bucket if now - ts < self.window_seconds]
+            bucket = self._cleanup_bucket(key, now)
             if len(bucket) >= self.max_hits:
                 retry = int(self.window_seconds - (now - bucket[0])) + 1
                 return False, max(retry, 1)
+            bucket = self.hits.setdefault(key, [])
             bucket.append(now)
             return True, 0
 
@@ -774,25 +795,46 @@ class LoginThrottle:
         self.failures: dict[str, list[float]] = {}
         self.locked_until: dict[str, float] = {}
 
+    def _make_key(self, ip: str, nickname: str) -> str:
+        normalized = nickname.strip().lower()
+        if len(normalized) > MAX_NICK_LEN:
+            normalized = normalized[:MAX_NICK_LEN]
+        return f"{ip}|{normalized}"
+
+    def _cleanup(self, now: float) -> None:
+        expired_failures = []
+        for key, bucket in self.failures.items():
+            bucket[:] = [ts for ts in bucket if now - ts < AUTH_WINDOW_SECONDS]
+            if not bucket:
+                expired_failures.append(key)
+        for key in expired_failures:
+            self.failures.pop(key, None)
+
+        expired_locks = [key for key, locked_until in self.locked_until.items() if locked_until <= now]
+        for key in expired_locks:
+            self.locked_until.pop(key, None)
+
     def check(self, ip: str, nickname: str) -> tuple[bool, int]:
-        key = f"{ip}|{nickname.lower()}"
+        key = self._make_key(ip, nickname)
         now = time.time()
         with self.lock:
+            self._cleanup(now)
             locked = self.locked_until.get(key, 0)
             if locked > now:
                 return False, int(locked - now) + 1
             return True, 0
 
     def success(self, ip: str, nickname: str) -> None:
-        key = f"{ip}|{nickname.lower()}"
+        key = self._make_key(ip, nickname)
         with self.lock:
             self.failures.pop(key, None)
             self.locked_until.pop(key, None)
 
     def fail(self, ip: str, nickname: str) -> tuple[bool, int]:
-        key = f"{ip}|{nickname.lower()}"
+        key = self._make_key(ip, nickname)
         now = time.time()
         with self.lock:
+            self._cleanup(now)
             bucket = self.failures.setdefault(key, [])
             bucket[:] = [ts for ts in bucket if now - ts < AUTH_WINDOW_SECONDS]
             bucket.append(now)
@@ -860,6 +902,7 @@ def require_session(request: dict[str, Any]) -> tuple[Optional[Session], Optiona
     if bool(user["is_banned"]):
         sessions.delete(session.token)
         return None, err("This account is banned.", "account_banned")
+    session.is_admin = bool(user["is_admin"])
     return session, None
 
 
@@ -945,18 +988,6 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
             )
             return err("Login temporarily blocked for this nickname from your address.", "login_throttled", retry)
         known_user = db.get_user_by_nickname(nickname)
-        if known_user is not None and bool(known_user["is_banned"]):
-            login_throttle.fail(ip, nickname)
-            time.sleep(1.0)
-            audit_log(
-                event="login_denied_banned",
-                action=action,
-                ip=ip,
-                actor_nickname=nickname,
-                status="denied",
-                details="account banned",
-            )
-            return err("This account is banned.", "account_banned")
         user = db.authenticate(nickname, password)
         if not user:
             login_throttle.fail(ip, nickname)
@@ -968,6 +999,18 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
                 actor_nickname=nickname or None,
                 status="fail",
                 details="invalid credentials",
+            )
+            return err("Invalid credentials.", "login_failed")
+        if known_user is not None and bool(known_user["is_banned"]):
+            login_throttle.fail(ip, nickname)
+            time.sleep(1.0)
+            audit_log(
+                event="login_denied_banned",
+                action=action,
+                ip=ip,
+                actor_nickname=nickname,
+                status="denied",
+                details="account banned",
             )
             return err("Invalid credentials.", "login_failed")
         login_throttle.success(ip, nickname)
