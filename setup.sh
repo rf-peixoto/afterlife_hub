@@ -70,6 +70,10 @@ validate_password() {
     local pass="$1"
     [[ -n "$pass" ]] || fail "Admin password cannot be empty."
     (( ${#pass} >= 12 )) || fail "Admin password must be at least 12 characters."
+    [[ "$pass" != *$'
+'* ]] || fail "Admin password cannot contain newline characters."
+    [[ "$pass" != *$'
+'* ]] || fail "Admin password cannot contain carriage return characters."
 }
 
 prompt_inputs() {
