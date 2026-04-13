@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import ipaddress
 import json
 import os
 import socket
@@ -11,19 +10,16 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
-# =========================
-# Configuration
-# =========================
 DEFAULT_HOST = os.environ.get("AFTERLIFE_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("AFTERLIFE_PORT", "2077"))
 SOCKET_TIMEOUT = 25
 MAX_RESPONSE_BYTES = int(os.environ.get("AFTERLIFE_MAX_RESPONSE_BYTES", "1048576"))
-WRAP_WIDTH = 78
-BOOT_DELAY = 0.18
+WRAP_WIDTH = 92
+BOOT_DELAY = 0.12
 
-# ANSI colors
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -34,11 +30,7 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 WHITE = "\033[37m"
 
-STATUS_COLORS = {
-    "OPEN": GREEN,
-    "DONE": CYAN,
-    "CANCELLED": RED,
-}
+STATUS_COLORS = {"OPEN": GREEN, "DONE": CYAN, "CANCELLED": RED}
 
 
 def c(text: str, color: str) -> str:
@@ -62,24 +54,26 @@ def pause() -> None:
 
 
 def wrap(text: str, indent: str = "") -> str:
-    if not text:
-        return ""
     width = max(20, WRAP_WIDTH - len(indent))
-    return "\n".join(indent + part for part in textwrap.wrap(text, width=width))
+    return "\n".join(indent + part for part in textwrap.wrap(text, width=width)) if text else ""
+
+
+def fmt_ts(ts: Optional[int]) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 def banner() -> str:
     inner = WRAP_WIDTH - 2
     title = "A F T E R L I F E".center(inner)
     subtitle = "private freelancer terminal".center(inner)
-    return "\n".join(
-        [
-            c("╔" + "═" * inner + "╗", CYAN),
-            c("║", CYAN) + c(title, MAGENTA + BOLD) + c("║", CYAN),
-            c("║", CYAN) + c(subtitle, DIM) + c("║", CYAN),
-            c("╚" + "═" * inner + "╝", CYAN),
-        ]
-    )
+    return "\n".join([
+        c("╔" + "═" * inner + "╗", CYAN),
+        c("║", CYAN) + c(title, MAGENTA + BOLD) + c("║", CYAN),
+        c("║", CYAN) + c(subtitle, DIM) + c("║", CYAN),
+        c("╚" + "═" * inner + "╝", CYAN),
+    ])
 
 
 def section(title: str, subtitle: Optional[str] = None) -> None:
@@ -96,20 +90,15 @@ def prompt(text: str, color: str = MAGENTA) -> str:
 
 def status_badge(status: str) -> str:
     normalized = str(status or "UNKNOWN").upper()
-    color = STATUS_COLORS.get(normalized, WHITE)
-    return c(f"● {normalized}", color)
+    return c(f"● {normalized}", STATUS_COLORS.get(normalized, WHITE))
 
 
 def key_value(label: str, value: str, value_color: str = WHITE) -> None:
-    print(c(f"{label:<10}: ", DIM) + c(str(value), value_color))
+    print(c(f"{label:<16}: ", DIM) + c(str(value), value_color))
 
 
 def boot_sequence() -> None:
-    steps = [
-        "initializing terminal shell...",
-        "establishing plaintext uplink...",
-    ]
-    for item in steps:
+    for item in ["initializing terminal shell...", "establishing plaintext uplink..."]:
         print(c(f"> {item}", DIM))
         time.sleep(BOOT_DELAY)
 
@@ -125,13 +114,10 @@ class RemoteClient:
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.session_token:
             payload.setdefault("session_token", self.session_token)
-
         raw = json.dumps(payload).encode("utf-8") + b"\n"
-
         with socket.create_connection((self.host, self.port), timeout=SOCKET_TIMEOUT) as sock:
             sock.settimeout(SOCKET_TIMEOUT)
             sock.sendall(raw)
-
             chunks = b""
             while not chunks.endswith(b"\n"):
                 data = sock.recv(4096)
@@ -140,21 +126,17 @@ class RemoteClient:
                 chunks += data
                 if len(chunks) > MAX_RESPONSE_BYTES:
                     raise RuntimeError(f"Server response exceeded {MAX_RESPONSE_BYTES} bytes.")
-
         if not chunks:
             raise RuntimeError("No response from server.")
-
         return json.loads(chunks.decode("utf-8").strip())
 
     def ping(self) -> bool:
-        response = self.request({"action": "ping"})
-        return bool(response.get("ok"))
+        return bool(self.request({"action": "ping"}).get("ok"))
 
 
 # =========================
 # Input helpers
 # =========================
-
 def ask(prompt_text: str, allow_blank: bool = False) -> str:
     while True:
         value = input(prompt(prompt_text)).strip()
@@ -171,11 +153,14 @@ def ask_hidden(prompt_text: str) -> str:
         print(c("input required.", RED))
 
 
-def ask_int(prompt_text: str) -> int:
+def ask_int(prompt_text: str, allow_negative: bool = False) -> int:
     while True:
         raw = input(prompt(prompt_text)).strip()
         try:
-            return int(raw)
+            value = int(raw)
+            if not allow_negative and value < 0:
+                raise ValueError
+            return value
         except ValueError:
             print(c("enter a valid number.", RED))
 
@@ -216,27 +201,32 @@ def show_result(response: dict[str, Any]) -> None:
 
 
 # =========================
-# Views
+# Rendering helpers
 # =========================
+def format_rep(rep: int) -> str:
+    if rep < 0:
+        return c(str(rep), RED + BOLD)
+    if rep > 0:
+        return c(f"+{rep}", GREEN)
+    return c("0", WHITE)
+
 
 def print_jobs(jobs: list[dict[str, Any]], include_author: bool = True, completed_mode: bool = False) -> None:
     if not jobs:
         print(c("no contracts found.", YELLOW))
         return
-
     for job in jobs:
-        lock_mark = c("[PRIVATE] ", YELLOW) if job.get("is_private") else ""
-        status = str(job.get("status", "open")).upper()
         print(c(f"[ CONTRACT #{int(job['id']):04d} ]", CYAN + BOLD))
-        print(lock_mark + c(str(job["title"]), WHITE + BOLD))
+        print(c(str(job["title"]), WHITE + BOLD))
         key_value("Reward", str(job["reward"]))
-        key_value("Status", status_badge(status))
+        key_value("Min rep", str(job.get("min_reputation", 0)), CYAN)
+        key_value("Status", status_badge(str(job.get("status", "open"))))
         if not completed_mode:
             key_value("Accepts", str(job.get("accept_count", 0)))
             if include_author and job.get("author_display"):
-                author_text = str(job["author_display"])
-                author_color = YELLOW if job.get("author_is_banned") else WHITE
-                key_value("Author", author_text, author_color)
+                key_value("Author", str(job["author_display"]))
+        if job.get("not_enough_reputation"):
+            print(c("[NOT ENOUGH REPUTATION]", RED + BOLD))
         print(line())
 
 
@@ -246,58 +236,85 @@ def print_job_details(data: dict[str, Any]) -> None:
     print(c(str(data["title"]), WHITE + BOLD))
     print(line("·"))
     key_value("Reward", str(data["reward"]))
+    key_value("Min rep", str(data.get("min_reputation", 0)), CYAN)
     key_value("Status", status_badge(str(data["status"])))
-    author_value = str(data.get("author_display") or data["author_nickname"])
-    author_color = YELLOW if data.get("author_is_banned") else WHITE
-    key_value("Author", author_value, author_color)
+    key_value("Author", str(data.get("author_display") or data["author_nickname"]))
     key_value("Private", "yes" if data["is_private"] else "no", YELLOW if data["is_private"] else WHITE)
     key_value("Accepts", str(data.get("accept_count", 0)))
+    if data.get("viewer_reputation") is not None:
+        print(c(f"Your reputation: ", DIM) + format_rep(int(data["viewer_reputation"])))
+    if data.get("not_enough_reputation"):
+        print(c("[NOT ENOUGH REPUTATION]", RED + BOLD))
     print()
-
     if data.get("description_visible"):
         print(c("[ DESCRIPTION // DECRYPTED ]", CYAN))
         print(wrap(data.get("description") or "", indent="  "))
     else:
-        print(c("[ DESCRIPTION // LOCKED ]", YELLOW + BOLD))
-        print(c("  use the private token to unlock this contract description.", DIM))
-
-    print()
-    workers = data.get("worker_pool")
-    if workers is not None:
-        print(c("[ WORKER POOL ]", CYAN))
-        if workers:
-            for worker in workers:
-                marker = c("  << SELECTED >>", GREEN) if data.get("selected_worker_id") == worker["id"] else ""
-                worker_name = f"[banned] {worker['nickname']}" if worker.get("is_banned") else worker["nickname"]
-                worker_color = YELLOW if worker.get("is_banned") else WHITE
-                print(
-                    c(f"  [{worker['id']}] ", MAGENTA)
-                    + c(worker_name, worker_color)
-                    + c(f"  rep={worker['reputation']}", DIM)
-                    + marker
-                )
-                print(c("      contact: ", DIM) + c(str(worker.get("contact_info", "")), CYAN))
+        print(c("[ DESCRIPTION LOCKED ] provide unlock token or be the author/admin.", YELLOW))
+    if data.get("worker_pool") is not None:
+        print()
+        print(c("[ ACCEPTED WORKERS ]", CYAN))
+        if data["worker_pool"]:
+            for worker in data["worker_pool"]:
+                marker = c("  <selected>", GREEN + BOLD) if data.get("selected_worker_id") == worker["id"] else ""
+                print(c(f"  [{worker['id']}] ", MAGENTA) + c(worker["nickname"], WHITE) + c(f"  rep={worker['reputation']}", DIM) + marker)
         else:
             print(c("  no workers assigned yet.", DIM))
 
 
+def print_chats(chats: list[dict[str, Any]]) -> None:
+    if not chats:
+        print(c("no chats found.", YELLOW))
+        return
+    for chat in chats:
+        print(c(f"[ CHAT #{int(chat['chat_id']):04d} ]", CYAN + BOLD) + c(f"  {chat['other_nickname']}", WHITE + BOLD))
+        key_value("Updated", fmt_ts(chat.get("updated_at")))
+        key_value("Unread", str(chat.get("unread_count", 0)), YELLOW if chat.get("unread_count", 0) else WHITE)
+        preview = str(chat.get("last_message") or "")
+        if preview:
+            print(wrap(preview[:WRAP_WIDTH * 2], indent="  "))
+        print(line())
+
+
+def print_messages(data: dict[str, Any]) -> None:
+    print(c(f"[ CHAT #{int(data['chat_id']):04d} WITH {data['other_nickname']} ]", CYAN + BOLD))
+    print(line())
+    messages = data.get("messages", [])
+    if not messages:
+        print(c("no messages in this chat.", YELLOW))
+        return
+    for msg in messages:
+        sender = str(msg.get("sender_nickname") or "system")
+        color = YELLOW if msg.get("message_type") == "system" else WHITE
+        print(c(f"#{int(msg['id']):04d}  {fmt_ts(msg.get('created_at'))}  {sender}", color + BOLD))
+        print(wrap(str(msg.get("body") or ""), indent="  "))
+        print(line("·"))
+
+
+def print_blocks(blocks: list[dict[str, Any]]) -> None:
+    if not blocks:
+        print(c("you have not blocked anyone.", YELLOW))
+        return
+    for item in blocks:
+        print(c(str(item["nickname"]), WHITE + BOLD) + c(f"  rep={item['reputation']}", DIM))
+    print(line())
+
+
+# =========================
+# Menus
+# =========================
 def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     clear()
     section("NODE LINK // PLAIN TCP", "no encryption – use in trusted networks only")
-
     boot_sequence()
     print(line("·"))
-
     host = ask(f"uplink host [{args.host}]> ", allow_blank=True) or args.host
     port_raw = ask(f"uplink port [{args.port}]> ", allow_blank=True) or str(args.port)
-
     try:
         port = int(port_raw)
     except ValueError:
         port = args.port
-
     client = RemoteClient(host=host, port=port)
-
     try:
         if client.ping():
             print(c("[ LINK UP ] connection established.", GREEN))
@@ -307,18 +324,12 @@ def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     except Exception as exc:
         print(c(f"[ CONNECTION FAILURE ] {exc}", RED))
         sys.exit(1)
-
-    time.sleep(0.5)
+    time.sleep(0.4)
     return client
 
 
 def auth_menu(client: RemoteClient) -> None:
-    choices = {
-        "login": "login",
-        "register": "register",
-        "quit": "quit",
-        "exit": "quit",
-    }
+    choices = {"login": "login", "register": "register", "quit": "quit", "exit": "quit"}
     while not client.session_token:
         clear()
         section("AUTH // SESSION GATE", "available actions: login, register, quit")
@@ -333,28 +344,16 @@ def auth_menu(client: RemoteClient) -> None:
                 client.session_token = data.get("session_token")
                 client.nickname = data.get("nickname")
                 client.is_admin = bool(data.get("is_admin"))
-                if client.session_token and client.nickname and not client.is_admin:
-                    profile = client.request({"action": "profile"})
-                    if profile.get("ok"):
-                        client.is_admin = bool(profile.get("data", {}).get("is_admin"))
-                time.sleep(0.6)
+                time.sleep(0.5)
             else:
                 pause()
         elif choice == "register":
             nickname = ask("new nickname> ")
             password = ask_hidden("new password> ")
-            contact_info = ask("contact info> ")
-            response = client.request(
-                {
-                    "action": "register",
-                    "nickname": nickname,
-                    "password": password,
-                    "contact_info": contact_info,
-                }
-            )
+            response = client.request({"action": "register", "nickname": nickname, "password": password})
             show_result(response)
             pause()
-        elif choice == "quit":
+        else:
             raise SystemExit(0)
 
 
@@ -367,56 +366,54 @@ def view_profile(client: RemoteClient) -> None:
         pause()
         return
     data = response["data"]
-    nickname = data["nickname"]
+    nickname = str(data["nickname"])
     if data.get("is_banned"):
         nickname = f"[banned] {nickname}"
     key_value("Nickname", nickname, YELLOW if data.get("is_banned") else WHITE + BOLD)
-    key_value("Contact", data.get("contact_info", ""), CYAN)
-    key_value("Reputation", str(data["reputation"]), CYAN)
+    print(c("Reputation       : ", DIM) + format_rep(int(data["reputation"])))
     key_value("Role", "admin" if data.get("is_admin") else "member", CYAN)
+    key_value("Created", fmt_ts(data.get("created_at")))
     print(line())
     pause()
 
 
 def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed_mode: bool = False) -> None:
     clear()
-    status_title = status.upper() if status else "ALL"
-    section(f"JOB BOARD // {status_title} CONTRACTS")
+    section(f"JOB BOARD // {(status or 'all').upper()} CONTRACTS")
     response = client.request({"action": "list_jobs", "status": status})
     if not response.get("ok"):
         show_result(response)
         pause()
         return
-    jobs = response["data"]["jobs"]
-    print_jobs(jobs, completed_mode=completed_mode)
+    print_jobs(response["data"]["jobs"], completed_mode=completed_mode)
     pause()
 
 
 def create_job_menu(client: RemoteClient) -> None:
     clear()
     section("CREATE CONTRACT // BROADCAST")
-    print(c("forbidden characters in text fields: ' \" \\ / %", DIM))
+    print(c("forbidden characters in text fields: ' \" \\ / % +", DIM))
     print(line("·"))
     title = ask("title> ")
     description = ask("description> ")
     reward = ask("reward> ")
+    min_reputation = ask("minimum reputation [can be negative]> ")
     is_private = yes_no("private contract? [yes/no]> ")
-    response = client.request(
-        {
-            "action": "create_job",
-            "title": title,
-            "description": description,
-            "reward": reward,
-            "is_private": is_private,
-        }
-    )
+    response = client.request({
+        "action": "create_job",
+        "title": title,
+        "description": description,
+        "reward": reward,
+        "min_reputation": min_reputation,
+        "is_private": is_private,
+    })
     show_result(response)
     if response.get("ok"):
         data = response.get("data", {})
         key_value("Contract", str(data.get("job_id")), GREEN)
         if data.get("private_token"):
             print(c("[ PRIVATE TOKEN // STORE SECURELY ]", YELLOW + BOLD))
-            print(c(data["private_token"], MAGENTA))
+            print(c(str(data["private_token"]), MAGENTA))
     pause()
 
 
@@ -425,91 +422,60 @@ def job_details_menu(client: RemoteClient) -> None:
     section("CONTRACT DETAILS // SECURE VIEW")
     job_id = ask_int("contract id> ")
     unlock_token = ask("unlock token [blank if none]> ", allow_blank=True)
-    response = client.request(
-        {
-            "action": "job_details",
-            "job_id": job_id,
-            **({"unlock_token": unlock_token} if unlock_token else {}),
-        }
-    )
+    response = client.request({"action": "job_details", "job_id": job_id, **({"unlock_token": unlock_token} if unlock_token else {})})
     if not response.get("ok"):
         show_result(response)
         pause()
         return
-
     data = response["data"]
     while True:
         clear()
-        section("CONTRACT DETAILS // LIVE VIEW", "available actions depend on your role")
+        section("CONTRACT DETAILS // LIVE VIEW")
         print_job_details(data)
         print(line("═", CYAN))
-        actions = {
-            "accept": "accept",
-            "withdraw": "withdraw",
-            "back": "back",
-        }
-        visible_actions = ["accept", "withdraw", "back"]
+        commands = ["back"]
+        if client.session_token and not data.get("not_enough_reputation") and not data.get("is_author") and str(data.get("status", "")).lower() == "open":
+            commands.append("accept")
+        if client.session_token and data.get("viewer_has_accepted"):
+            commands.append("withdraw")
         if data.get("is_author") or data.get("is_admin"):
-            actions.update(
-                {
-                    "select worker": "select worker",
-                    "done": "done",
-                    "cancelled": "cancelled",
-                    "reopen": "reopen",
-                }
-            )
-            visible_actions = ["accept", "withdraw", "select worker", "done", "cancelled", "reopen", "back"]
+            commands.extend(["select worker", "done", "cancelled", "reopen"])
         if data.get("is_admin"):
-            actions.update({"delete": "delete"})
-            visible_actions.insert(-1, "delete")
-        print(c("commands: " + ", ".join(visible_actions), CYAN))
-        choice = choose("contract@view> ", actions)
+            commands.append("delete")
+        print(c("commands: " + ", ".join(commands), CYAN))
+        choice = choose("contract@view> ", {k: k for k in commands})
         if choice == "accept":
-            resp = client.request({"action": "accept_job", "job_id": data["id"]})
-            show_result(resp)
+            show_result(client.request({"action": "accept_job", "job_id": data["id"]}))
             pause()
         elif choice == "withdraw":
-            resp = client.request({"action": "withdraw_job", "job_id": data["id"]})
-            show_result(resp)
+            show_result(client.request({"action": "withdraw_job", "job_id": data["id"]}))
             pause()
-        elif choice == "select worker" and (data.get("is_author") or data.get("is_admin")):
+        elif choice == "select worker":
             worker_id = ask_int("worker id> ")
-            resp = client.request({"action": "select_worker", "job_id": data["id"], "worker_id": worker_id})
-            show_result(resp)
+            show_result(client.request({"action": "select_worker", "job_id": data["id"], "worker_id": worker_id}))
             pause()
-        elif choice == "done" and (data.get("is_author") or data.get("is_admin")):
-            resp = client.request({"action": "set_status", "job_id": data["id"], "status": "done"})
-            show_result(resp)
+        elif choice == "done":
+            show_result(client.request({"action": "set_status", "job_id": data["id"], "status": "done"}))
             pause()
-        elif choice == "cancelled" and (data.get("is_author") or data.get("is_admin")):
-            resp = client.request({"action": "set_status", "job_id": data["id"], "status": "cancelled"})
-            show_result(resp)
+        elif choice == "cancelled":
+            show_result(client.request({"action": "set_status", "job_id": data["id"], "status": "cancelled"}))
             pause()
-        elif choice == "reopen" and (data.get("is_author") or data.get("is_admin")):
-            resp = client.request({"action": "set_status", "job_id": data["id"], "status": "open"})
-            show_result(resp)
+        elif choice == "reopen":
+            show_result(client.request({"action": "set_status", "job_id": data["id"], "status": "open"}))
             pause()
-        elif choice == "delete" and data.get("is_admin"):
+        elif choice == "delete":
             if yes_no(f"delete contract #{data['id']} permanently? [yes/no]> "):
                 resp = client.request({"action": "delete_job", "job_id": data["id"]})
                 show_result(resp)
                 pause()
                 if resp.get("ok"):
                     return
-            else:
-                print(c("operation cancelled.", YELLOW))
-                pause()
-        elif choice == "back":
+        else:
             return
-
-        refresh = client.request(
-            {
-                "action": "job_details",
-                "job_id": data["id"],
-                **({"unlock_token": unlock_token} if unlock_token else {}),
-            }
-        )
+        refresh = client.request({"action": "job_details", "job_id": data["id"], **({"unlock_token": unlock_token} if unlock_token else {})})
         if not refresh.get("ok"):
+            show_result(refresh)
+            pause()
             return
         data = refresh["data"]
 
@@ -528,7 +494,7 @@ def my_jobs_menu(client: RemoteClient) -> None:
 
 def my_accepts_menu(client: RemoteClient) -> None:
     clear()
-    section("MY CONTRACTS // ACCEPTED + COMPLETED", "descriptions remain omitted here, including private contracts")
+    section("MY CONTRACTS // ACCEPTED + COMPLETED")
     response = client.request({"action": "my_accepts"})
     if not response.get("ok"):
         show_result(response)
@@ -538,19 +504,101 @@ def my_accepts_menu(client: RemoteClient) -> None:
     pause()
 
 
+def rate_user_menu(client: RemoteClient) -> None:
+    clear()
+    section("REPUTATION // RATE USER")
+    nickname = ask("nickname> ")
+    rating = choose("rating [positive/negative]> ", {"positive": "positive", "negative": "negative"})
+    show_result(client.request({"action": "rate_user", "nickname": nickname, "rating": rating}))
+    pause()
+
+
+def blocks_menu(client: RemoteClient) -> None:
+    while True:
+        clear()
+        section("BLOCK LIST // RELATION FILTER")
+        response = client.request({"action": "list_blocks"})
+        if not response.get("ok"):
+            show_result(response)
+            pause()
+            return
+        print_blocks(response["data"].get("blocks", []))
+        print(c("commands: block, unblock, back", CYAN))
+        choice = choose("blocks@node> ", {"block": "block", "unblock": "unblock", "back": "back"})
+        if choice == "block":
+            nickname = ask("nickname> ")
+            show_result(client.request({"action": "block_user", "nickname": nickname}))
+            pause()
+        elif choice == "unblock":
+            nickname = ask("nickname> ")
+            show_result(client.request({"action": "unblock_user", "nickname": nickname}))
+            pause()
+        else:
+            return
+
+
+def chats_menu(client: RemoteClient) -> None:
+    while True:
+        clear()
+        section("PRIVATE MESSAGES // ENCRYPTED")
+        response = client.request({"action": "list_chats"})
+        if not response.get("ok"):
+            show_result(response)
+            pause()
+            return
+        print_chats(response["data"].get("chats", []))
+        print(c("commands: open, view, read, send, back", CYAN))
+        choice = choose("chat@node> ", {"open": "open", "view": "view", "read": "read", "send": "send", "back": "back"})
+        if choice == "open":
+            nickname = ask("chat <nickname> > ")
+            resp = client.request({"action": "open_chat", "nickname": nickname})
+            show_result(resp)
+            if resp.get("ok") and resp.get("data"):
+                key_value("Chat", str(resp["data"].get("chat_id")), GREEN)
+            pause()
+        elif choice == "view":
+            chat_id = ask_int("chat id> ")
+            resp = client.request({"action": "list_messages", "chat_id": chat_id})
+            if resp.get("ok"):
+                clear()
+                section("PRIVATE MESSAGES // CHAT VIEW")
+                print_messages(resp["data"])
+            else:
+                show_result(resp)
+            pause()
+        elif choice == "read":
+            message_id = ask_int("message id> ")
+            resp = client.request({"action": "read_message", "message_id": message_id})
+            if resp.get("ok"):
+                data = resp["data"]
+                clear()
+                section("PRIVATE MESSAGES // SINGLE MESSAGE")
+                key_value("Message id", str(data["id"]))
+                key_value("Chat", str(data["chat_id"]))
+                key_value("From", str(data["sender_nickname"]))
+                key_value("When", fmt_ts(data.get("created_at")))
+                print(line("·"))
+                print(wrap(str(data.get("body") or ""), indent="  "))
+            else:
+                show_result(resp)
+            pause()
+        elif choice == "send":
+            chat_id = ask_int("chat id> ")
+            message = ask("message> ")
+            show_result(client.request({"action": "send_message", "chat_id": chat_id, "message": message}))
+            pause()
+        else:
+            return
+
+
 def ban_user_menu(client: RemoteClient) -> None:
     clear()
     section("ADMIN BAN // PERMANENT ACTION")
-    print(c("this permanently bans a member account. input must match the exact nickname.", YELLOW))
-    print(line("·"))
     nickname = ask("nickname to ban> ")
-    confirm = yes_no(f"ban {nickname} permanently? [yes/no]> ")
-    if not confirm:
+    if yes_no(f"ban {nickname} permanently? [yes/no]> "):
+        show_result(client.request({"action": "ban_user", "nickname": nickname}))
+    else:
         print(c("operation cancelled.", YELLOW))
-        pause()
-        return
-    response = client.request({"action": "ban_user", "nickname": nickname})
-    show_result(response)
     pause()
 
 
@@ -571,6 +619,9 @@ def main_menu(client: RemoteClient) -> None:
         "my accepted": "my accepted",
         "accepted": "my accepted",
         "profile": "profile",
+        "rate": "rate",
+        "blocks": "blocks",
+        "chats": "chats",
         "ban": "ban",
         "logout": "logout",
         "quit": "quit",
@@ -581,14 +632,7 @@ def main_menu(client: RemoteClient) -> None:
         section("MAIN GRID // OPERATOR CONSOLE")
         operator_label = (client.nickname or "unknown") + (" [admin]" if client.is_admin else "")
         key_value("Operator", operator_label, GREEN)
-        commands = (
-            "commands: open jobs, done jobs, cancelled jobs, create job, job details, "
-            "my authored jobs, my accepted, profile"
-        )
-        if client.is_admin:
-            commands += ", ban"
-        commands += ", logout, quit"
-        print(c(commands, CYAN))
+        print(c("commands: open jobs, done jobs, cancelled jobs, create job, job details, my authored jobs, my accepted, profile, rate, blocks, chats" + (", ban" if client.is_admin else "") + ", logout, quit", CYAN))
         print(line("·"))
         choice = choose("afterlife@node> ", choices)
         if choice == "open jobs":
@@ -607,6 +651,12 @@ def main_menu(client: RemoteClient) -> None:
             my_accepts_menu(client)
         elif choice == "profile":
             view_profile(client)
+        elif choice == "rate":
+            rate_user_menu(client)
+        elif choice == "blocks":
+            blocks_menu(client)
+        elif choice == "chats":
+            chats_menu(client)
         elif choice == "ban":
             if client.is_admin:
                 ban_user_menu(client)
@@ -614,21 +664,18 @@ def main_menu(client: RemoteClient) -> None:
                 print(c("admin only option.", RED))
                 pause()
         elif choice == "logout":
-            response = client.request({"action": "logout"})
-            show_result(response)
+            show_result(client.request({"action": "logout"}))
             client.session_token = None
             client.nickname = None
             client.is_admin = False
             pause()
             return
-        elif choice == "quit":
+        else:
             raise SystemExit(0)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="AFTERLIFE client – plain TCP terminal interface."
-    )
+    parser = argparse.ArgumentParser(description="AFTERLIFE client – plain TCP terminal interface.")
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Server host/IP (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
     return parser.parse_args()
