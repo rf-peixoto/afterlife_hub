@@ -25,7 +25,7 @@ from cryptography.fernet import Fernet, InvalidToken
 # =========================
 HOST = os.environ.get("AFTERLIFE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AFTERLIFE_PORT", "2077"))
-DB_PATH = Path(os.environ.get("AFTERLIFE_DB_PATH", "./AFTERLIFE_space.db"))
+DB_PATH = Path(os.environ.get("AFTERLIFE_DB_PATH", "./AFTERLIFE.db"))
 MASTER_KEY_PATH = Path(os.environ.get("AFTERLIFE_MASTER_KEY_PATH", "./master.key"))
 LOG_PATH = Path(os.environ.get("AFTERLIFE_LOG_PATH", "./server.log"))
 
@@ -1345,7 +1345,7 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
 
     if action == "ping":
         audit_log(event="request", action=action, ip=ip, status="success")
-        return ok({"server": "AFTERLIFE-space", "version": 3}, "pong")
+        return ok({"server": "AFTERLIFE", "version": 1}, "Welcome to AFTERLIFE")
 
     if action == "register":
         nickname = str(request.get("nickname", "")).strip()
