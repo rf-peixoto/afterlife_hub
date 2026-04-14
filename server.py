@@ -47,7 +47,7 @@ MAX_WORKERS = int(os.environ.get("AFTERLIFE_MAX_WORKERS", "32"))
 FORBIDDEN_CHARS = set("'\"\\/%+")
 ALLOWED_TEXT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,256}$")
 MESSAGE_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,128}$")
-NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
+NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,12}$")
 RATING_CHOICES = {"positive": 1, "negative": -1}
 
 GLOBAL_WINDOW_SECONDS = 10
