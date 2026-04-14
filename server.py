@@ -534,6 +534,9 @@ class Database:
         private_token = secrets.token_urlsafe(16) if is_private else ""
         password_hash = pbkdf2_hash(private_token) if is_private else None
         with self.lock, self.conn() as con:
+            author = con.execute("SELECT reputation FROM users WHERE id = ?", (author_id,)).fetchone()
+            author_reputation = int(author["reputation"]) if author is not None else 0
+            effective_min_reputation = min(int(min_reputation), author_reputation)
             cur = con.execute(
                 """
                 INSERT INTO jobs (
@@ -546,7 +549,7 @@ class Database:
                     get_crypto().enc(title),
                     get_crypto().enc(description),
                     reward,
-                    min_reputation,
+                    effective_min_reputation,
                     1 if is_private else 0,
                     password_hash,
                     now,
@@ -663,10 +666,10 @@ class Database:
         data["selected_worker_id"] = row["selected_worker_id"]
         return True, "OK", data
 
-    def accept_job(self, job_id: int, user_id: int) -> tuple[bool, str]:
+    def accept_job(self, job_id: int, user_id: int, private_token: Optional[str]) -> tuple[bool, str]:
         with self.lock, self.conn() as con:
             row = con.execute(
-                "SELECT author_id, status, min_reputation FROM jobs WHERE id = ?",
+                "SELECT author_id, status, min_reputation, is_private, description_password_hash FROM jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             user = con.execute("SELECT reputation, is_banned FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -682,6 +685,9 @@ class Database:
                 return False, "Not allowed."
             if int(user["reputation"]) < int(row["min_reputation"]):
                 return False, "Not enough reputation."
+            if bool(row["is_private"]):
+                if not private_token or not row["description_password_hash"] or not pbkdf2_verify(private_token, str(row["description_password_hash"])):
+                    return False, "Invalid private token."
             try:
                 con.execute(
                     "INSERT INTO job_accepts (job_id, user_id, created_at) VALUES (?, ?, ?)",
@@ -1446,7 +1452,9 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
             job_id = int(request.get("job_id"))
         except Exception:
             return err("Invalid job id.", "validation_error")
-        success, message = get_db().accept_job(job_id, session.user_id)
+        private_token_raw = request.get("private_token")
+        private_token = str(private_token_raw).strip() if private_token_raw is not None else None
+        success, message = get_db().accept_job(job_id, session.user_id, private_token)
         audit_log(event="job_accept", action=action, ip=ip, actor_nickname=session.nickname, job_id=job_id, status="success" if success else "fail", details=message)
         return ok(message=message) if success else err(message, "accept_failed")
 

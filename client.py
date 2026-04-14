@@ -445,7 +445,12 @@ def job_details_menu(client: RemoteClient) -> None:
         print(c("commands: " + ", ".join(commands), CYAN))
         choice = choose("contract@view> ", {k: k for k in commands})
         if choice == "accept":
-            show_result(client.request({"action": "accept_job", "job_id": data["id"]}))
+            accept_request = {"action": "accept_job", "job_id": data["id"]}
+            if data.get("is_private"):
+                private_token = ask("private token> ", allow_blank=True)
+                if private_token:
+                    accept_request["private_token"] = private_token
+            show_result(client.request(accept_request))
             pause()
         elif choice == "withdraw":
             show_result(client.request({"action": "withdraw_job", "job_id": data["id"]}))
