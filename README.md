@@ -1,91 +1,46 @@
 # AFTERLIFE Hub
 
-AFTERLIFE Hub is a minimalist remote freelancer platform with a cyberpunk terminal-style interface.
+Minimalist cyberpunk-style freelance work and trust marketplace with a terminal-first client/server architecture.
 
-It is composed of two parts:
+## Core features
 
-- **server** → hosts the application, database, users, and jobs
-- **client** → connects remotely to the server so users can log in, post jobs, and manage their accounts
+* user registration and authentication
+* bootstrap admin account
+* session-based access control
+* job creation and browsing
+* private jobs protected by access token
+* reputation-gated jobs
+* accept / withdraw job workflows
+* authored and accepted job tracking
+* direct chat between participants
+* block list and user isolation controls
+* user rating / reputation updates
+* moderation controls
+  * ban users
+  * delete jobs
+  * delete sessions
+* audit logging
+* rate limiting and request validation
+* SQLite persistence
+* Docker / Docker Compose support
 
-The platform includes:
 
-- user registration and login
-- mandatory bootstrap admin account
-- job posting and browsing
-- private jobs with controlled visibility
-- admin moderation features
-  - ban users
-  - delete any job
-- input validation and basic rate limiting
-- terminal-first UX
+## Project structure
 
----
+```text
+server.py          # core server, database, security checks
+client.py          # terminal client
+setup.sh           # local setup helper
+Dockerfile         # container build
+Docker-compose.yml # deployment helper
+requirements.txt   # dependencies
+```
 
 ## Quick start
 
-Run the setup script:
-
 ```bash
+dos2unix *        # Code may contain /r characteres
 chmod +x setup.sh
 ./setup.sh
 ```
 
-The script will:
-
-- install Python dependencies
-- ask for the **admin username and password**
-- create/update the mandatory admin account
-- start the server
-
----
-
-## Running manually
-
-### Start server
-
-```bash
-python3 server.py
-```
-
-### Start client
-
-```bash
-python3 client.py
-```
-
-The client will ask for:
-
-- server IP
-- port
-
-Then users can log in normally.
-
----
-
-## Default workflow
-
-1. Run `setup.sh` on the server
-2. Create the admin credentials during setup
-3. Start `client.py` from another machine
-4. Connect to the server IP and port
-5. Log in with the admin account
-
----
-
-## Admin capabilities
-
-The admin account can:
-
-- ban users
-- delete any job
-- manage platform moderation
-
-These commands are available automatically after logging in as admin.
-
----
-
-## Notes
-
-This version intentionally runs **without TLS/SSL** to keep deployment simple while the platform is under active development.
-
-Do not expose it to the public internet without adding transport security and firewall rules.
