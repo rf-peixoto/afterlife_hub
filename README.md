@@ -1,4 +1,5 @@
 # AFTERLIFE Hub
+```{"ok":true,"message":"Welcome to AFTERLIFE","data":{"server":"AFTERLIFE","version":1}}```
 
 Minimalist cyberpunk-style freelance work and trust marketplace with a terminal-first client/server architecture.
 
