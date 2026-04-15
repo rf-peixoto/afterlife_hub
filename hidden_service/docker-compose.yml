@@ -10,10 +10,11 @@ services:
     volumes:
       # Application data: database, master key, server log.
       - ./data:/app/data
-      # Tor hidden service keys. Mounting this directory means the .onion
-      # address is preserved across container rebuilds. Without this, every
-      # rebuild would generate a new .onion address.
+      # Tor hidden service keys. Preserves the .onion address across rebuilds.
       - ./tor-hs:/var/lib/tor/afterlife_hs
+      # Tor data directory: consensus, cached descriptors, state.
+      # Persisting this avoids a cold bootstrap on every restart.
+      - ./tor-data:/var/lib/tor/data
 
     environment:
       AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
@@ -23,5 +24,6 @@ services:
       AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
       AFTERLIFE_PORT: ${AFTERLIFE_PORT:-2077}
 
-    security_opt:
-      - no-new-privileges:true
+    # Note: no-new-privileges:true was removed. On some VPS Docker configurations
+    # this flag prevents root inside the container from managing volume-mounted
+    # directories, causing the entrypoint to fail silently before any log output.

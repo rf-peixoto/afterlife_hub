@@ -3,9 +3,10 @@ set -euo pipefail
 
 DATA_DIR="./data"
 TOR_HS_DIR="./tor-hs"
+TOR_DATA_DIR="./tor-data"
 ENV_FILE="./.env"
 DEFAULT_CONTAINER_NAME="afterlife-server"
-STARTUP_WAIT_SECONDS=60
+STARTUP_WAIT_SECONDS=120
 HEALTHCHECK_LOG_TAIL=80
 
 GREEN="\033[1;32m"
@@ -53,7 +54,6 @@ check_dependencies() {
 }
 
 validate_admin_user() {
-    # Must match server.py NICK_RE: 3-12 chars, letters/digits/underscore only.
     [[ "$1" =~ ^[A-Za-z0-9_]{3,12}$ ]] || fail "Admin username must be 3-12 chars, letters/digits/underscore only."
 }
 
@@ -83,11 +83,12 @@ prompt_inputs() {
 
 prepare_folders() {
     info "Preparing folder structure..."
-    sudo mkdir -p "$DATA_DIR" "$TOR_HS_DIR"
-    # tor-hs must be mode 700 and owned by the debian-tor user inside the
-    # container. We set it here; entrypoint.sh sets the final ownership/mode.
-    sudo chmod 700 "$TOR_HS_DIR"
+    sudo mkdir -p "$DATA_DIR" "$TOR_HS_DIR" "$TOR_DATA_DIR"
     sudo chmod 700 "$DATA_DIR"
+    # tor-hs and tor-data start as root:root. We fix ownership after the
+    # image is built, once we know debian-tor's actual UID inside the container.
+    sudo chmod 755 "$TOR_HS_DIR"
+    sudo chmod 755 "$TOR_DATA_DIR"
 }
 
 write_env() {
@@ -112,12 +113,54 @@ apply_permissions() {
     [[ -f "${DATA_DIR}/AFTERLIFE.db" ]] && sudo chmod 600 "${DATA_DIR}/AFTERLIFE.db" || true
 }
 
+build_image() {
+    local compose
+    compose="$(compose_cmd)"
+    info "Building Docker image..."
+    $compose --env-file "$ENV_FILE" build
+}
+
+fix_tor_directory_ownership() {
+    # Tor requires HiddenServiceDir to be owned by the tor user (debian-tor)
+    # and mode 700. On some Docker configurations (user namespace remapping),
+    # root inside the container cannot chown volume-mounted host directories.
+    # We solve this on the HOST: query debian-tor's UID from the built image,
+    # then chown the directories before the container starts.
+    local compose
+    compose="$(compose_cmd)"
+
+    info "Querying debian-tor UID from built image..."
+    local deb_tor_uid deb_tor_gid
+    deb_tor_uid="$($compose --env-file "$ENV_FILE" run \
+        --rm --no-deps --entrypoint "" \
+        afterlife-server \
+        id -u debian-tor 2>/dev/null || echo "")"
+    deb_tor_gid="$($compose --env-file "$ENV_FILE" run \
+        --rm --no-deps --entrypoint "" \
+        afterlife-server \
+        id -g debian-tor 2>/dev/null || echo "")"
+
+    if [[ "$deb_tor_uid" =~ ^[0-9]+$ && "$deb_tor_gid" =~ ^[0-9]+$ ]]; then
+        info "Setting tor directory ownership to debian-tor (UID ${deb_tor_uid} GID ${deb_tor_gid})..."
+        sudo chown "${deb_tor_uid}:${deb_tor_gid}" "$TOR_HS_DIR"
+        sudo chmod 700 "$TOR_HS_DIR"
+        sudo chown "${deb_tor_uid}:${deb_tor_gid}" "$TOR_DATA_DIR"
+        sudo chmod 700 "$TOR_DATA_DIR"
+    else
+        warn "Could not determine debian-tor UID. Falling back to UID 107 (Debian default)."
+        sudo chown "107:107" "$TOR_HS_DIR"
+        sudo chmod 700 "$TOR_HS_DIR"
+        sudo chown "107:107" "$TOR_DATA_DIR"
+        sudo chmod 700 "$TOR_DATA_DIR"
+    fi
+}
+
 start_stack() {
     local compose
     compose="$(compose_cmd)"
     info "Starting Docker stack..."
     $compose --env-file "$ENV_FILE" down >/dev/null 2>&1 || true
-    $compose --env-file "$ENV_FILE" up -d --build
+    $compose --env-file "$ENV_FILE" up -d
 }
 
 container_exists() {
@@ -131,7 +174,7 @@ logs_show_listening() {
 
 logs_show_permission_error() {
     docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>&1 \
-        | grep -q "PermissionError"
+        | grep -q "Permission denied"
 }
 
 wait_for_onion_address() {
@@ -159,9 +202,10 @@ show_diagnostics() {
     echo "Container : ${CONTAINER_NAME}"
     echo "Data dir  : $(realpath "$DATA_DIR" 2>/dev/null || echo "$DATA_DIR")"
     echo "HS dir    : $(realpath "$TOR_HS_DIR" 2>/dev/null || echo "$TOR_HS_DIR")"
+    echo "Tor data  : $(realpath "$TOR_DATA_DIR" 2>/dev/null || echo "$TOR_DATA_DIR")"
     echo
     echo "Host permissions:"
-    ls -ld "$DATA_DIR" "$TOR_HS_DIR" || true
+    ls -ld "$DATA_DIR" "$TOR_HS_DIR" "$TOR_DATA_DIR" || true
     echo
     echo "Recent docker logs:"
     docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>/dev/null || true
@@ -200,17 +244,23 @@ main() {
     prepare_folders
     write_env
     apply_permissions
+    build_image
+    fix_tor_directory_ownership
     start_stack
 
     if ! container_exists; then
         fail "Container '${CONTAINER_NAME}' was not created. Check docker-compose.yml."
     fi
 
+    sleep 3
+
     local onion_addr
     if ! onion_addr="$(wait_for_onion_address)"; then
         show_diagnostics
         fail "Timed out waiting for Tor hidden service address. Check logs above."
     fi
+
+    sleep 2
 
     if ! logs_show_listening; then
         if logs_show_permission_error; then

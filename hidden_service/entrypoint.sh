@@ -1,30 +1,44 @@
 #!/bin/bash
 # AFTERLIFE container entrypoint.
-# Runs as root: starts the tor daemon under the debian-tor user,
-# waits for the hidden service hostname to be generated, prints it,
-# then starts the AFTERLIFE server under the afterlife user.
+# Runs as root: starts tor under debian-tor, waits for the hidden service
+# hostname, then supervises the AFTERLIFE server under the afterlife user.
+# If the server crashes it is restarted WITHOUT restarting tor so the .onion
+# address stays reachable throughout.
 set -e
 
 ONION_FILE="/var/lib/tor/afterlife_hs/hostname"
-TOR_WAIT_SECONDS=60
+TOR_WAIT_SECONDS=90
 SERVER_PORT="${AFTERLIFE_PORT:-2077}"
+SERVER_MAX_RESTARTS=20      # give up after this many consecutive crashes
+SERVER_RESTART_DELAY=3      # seconds to wait before restarting
 
-log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 fatal() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2; exit 1; }
 
-# ── Permissions ────────────────────────────────────────────────────────────────
-# The hidden service directory must be owned by debian-tor and mode 700,
-# or Tor will refuse to start.
-chown -R debian-tor:debian-tor /var/lib/tor
-chmod 700 /var/lib/tor/afterlife_hs
+log "Entrypoint started. PID=$$"
 
-# The app data directory is owned by the afterlife user.
-chown -R afterlife:afterlife /app/data
+# ── Permissions ────────────────────────────────────────────────────────────────
+# setup.sh chowns the volume-mounted directories on the host before the
+# container starts (fix for user-namespace remapping on some VPS configs).
+# These calls are a belt-and-suspenders fallback that silently continues on
+# failure so the entrypoint never dies before producing any log output.
+log "Applying permissions..."
+chown debian-tor:debian-tor /var/lib/tor/afterlife_hs 2>/dev/null \
+    || log "Warning: could not chown afterlife_hs (host-side chown handles this)."
+chmod 700 /var/lib/tor/afterlife_hs 2>/dev/null \
+    || log "Warning: could not chmod afterlife_hs."
+chown debian-tor:debian-tor /var/lib/tor/data 2>/dev/null \
+    || log "Warning: could not chown tor data dir."
+chmod 700 /var/lib/tor/data 2>/dev/null \
+    || log "Warning: could not chmod tor data dir."
+chown -R afterlife:afterlife /app/data 2>/dev/null \
+    || log "Warning: could not chown /app/data."
 
 # ── Start Tor ──────────────────────────────────────────────────────────────────
 log "Starting Tor hidden service..."
-runuser -u debian-tor -- tor -f /etc/tor/torrc &
+su -s /bin/sh debian-tor -c "tor -f /etc/tor/torrc" &
 TOR_PID=$!
+log "Tor started with PID ${TOR_PID}."
 
 # ── Wait for .onion hostname ───────────────────────────────────────────────────
 log "Waiting for hidden service hostname (up to ${TOR_WAIT_SECONDS}s)..."
@@ -34,7 +48,7 @@ while [[ ! -s "$ONION_FILE" ]]; do
         fatal "Tor process exited before creating the hidden service hostname."
     fi
     if (( elapsed >= TOR_WAIT_SECONDS )); then
-        fatal "Hidden service hostname not created after ${TOR_WAIT_SECONDS}s. Check Tor logs above."
+        fatal "Hidden service hostname not created after ${TOR_WAIT_SECONDS}s."
     fi
     sleep 1
     (( elapsed++ ))
@@ -48,14 +62,55 @@ log "Onion address : ${ONION_ADDR}"
 log "Client command: proxychains python3 client.py --host ${ONION_ADDR} --port ${SERVER_PORT}"
 log "========================================="
 
-# ── Trap: kill Tor when server exits ──────────────────────────────────────────
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+# Registered here so it covers both tor and the server restart loop.
+SERVER_PID=""
 cleanup() {
-    log "Shutting down Tor..."
+    log "Shutting down..."
+    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
     kill "$TOR_PID" 2>/dev/null || true
+    [[ -n "$SERVER_PID" ]] && wait "$SERVER_PID" 2>/dev/null || true
     wait "$TOR_PID" 2>/dev/null || true
 }
 trap cleanup EXIT TERM INT
 
-# ── Start AFTERLIFE server ─────────────────────────────────────────────────────
-log "Starting AFTERLIFE server on 127.0.0.1:${SERVER_PORT}..."
-exec runuser -u afterlife -- python /app/server.py --host 127.0.0.1 --port "${SERVER_PORT}"
+# ── Server supervisor loop ────────────────────────────────────────────────────
+# The server is restarted here on crash WITHOUT restarting Tor.
+# This keeps the hidden service reachable during brief server failures
+# instead of triggering a full container restart (which forces Tor to
+# re-bootstrap and leaves port 2077 unreachable for 10-30 seconds).
+restarts=0
+while (( restarts < SERVER_MAX_RESTARTS )); do
+
+    # Abort if Tor itself has died — no point running without it.
+    if ! kill -0 "$TOR_PID" 2>/dev/null; then
+        fatal "Tor process died unexpectedly."
+    fi
+
+    log "Starting AFTERLIFE server on 127.0.0.1:${SERVER_PORT} (attempt $((restarts + 1)))..."
+    su -s /bin/sh afterlife -c \
+        "python /app/server.py --host 127.0.0.1 --port ${SERVER_PORT}" &
+    SERVER_PID=$!
+
+    # Wait for the server process, capturing its exit code without
+    # letting set -e kill the entrypoint on non-zero.
+    server_exit=0
+    wait "$SERVER_PID" || server_exit=$?
+
+    if (( server_exit == 0 )); then
+        log "Server exited normally (code 0)."
+        exit 0
+    fi
+
+    # SIGTERM (143) or SIGINT (130) means intentional shutdown.
+    if (( server_exit == 143 || server_exit == 130 )); then
+        log "Server received shutdown signal (code ${server_exit})."
+        exit 0
+    fi
+
+    restarts=$(( restarts + 1 ))
+    log "Server crashed (exit code ${server_exit}). Restart ${restarts}/${SERVER_MAX_RESTARTS} in ${SERVER_RESTART_DELAY}s..."
+    sleep "$SERVER_RESTART_DELAY"
+done
+
+fatal "Server crashed ${SERVER_MAX_RESTARTS} times. Giving up — check logs above."
