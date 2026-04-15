@@ -23,7 +23,7 @@ chown -R afterlife:afterlife /app/data
 
 # ── Start Tor ──────────────────────────────────────────────────────────────────
 log "Starting Tor hidden service..."
-su -s /bin/sh debian-tor -c "tor -f /etc/tor/torrc" &
+runuser -u debian-tor -- tor -f /etc/tor/torrc &
 TOR_PID=$!
 
 # ── Wait for .onion hostname ───────────────────────────────────────────────────
@@ -58,4 +58,4 @@ trap cleanup EXIT TERM INT
 
 # ── Start AFTERLIFE server ─────────────────────────────────────────────────────
 log "Starting AFTERLIFE server on 127.0.0.1:${SERVER_PORT}..."
-exec su -s /bin/sh afterlife -c "python /app/server.py --host 127.0.0.1 --port ${SERVER_PORT}"
+exec runuser -u afterlife -- python /app/server.py --host 127.0.0.1 --port "${SERVER_PORT}"
