@@ -6,6 +6,8 @@ SocksPort 0
 # connections to the AFTERLIFE server on loopback.
 HiddenServiceDir /var/lib/tor/afterlife_hs
 HiddenServicePort 2077 127.0.0.1:2077
+HiddenServiceMaxStreams 20
+HiddenServiceMaxStreamsCloseCircuit 1
 
 # Require v3 onion addresses (v2 is deprecated and insecure).
 HiddenServiceVersion 3
