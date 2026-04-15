@@ -1,0 +1,17 @@
+# AFTERLIFE hidden service configuration.
+# No SOCKS proxy - this instance only serves as a hidden service relay.
+SocksPort 0
+
+# Hidden service: Tor listens on the .onion address and forwards
+# connections to the AFTERLIFE server on loopback.
+HiddenServiceDir /var/lib/tor/afterlife_hs
+HiddenServicePort 2077 127.0.0.1:2077
+
+# Require v3 onion addresses (v2 is deprecated and insecure).
+HiddenServiceVersion 3
+
+# Log to stderr so Docker captures it.
+Log notice stderr
+
+# Tor data directory (distinct from hidden service directory).
+DataDirectory /var/lib/tor/data

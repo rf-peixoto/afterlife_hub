@@ -1,0 +1,24 @@
+services:
+  afterlife-server:
+    build: .
+    container_name: afterlife-server
+    restart: unless-stopped
+
+    # No ports: section. The service is only reachable via the Tor hidden
+    # service. Exposing a port here would defeat the purpose.
+
+    volumes:
+      # Application data: database, master key, server log.
+      - ./data:/app/data
+      # Tor hidden service keys. Mounting this directory means the .onion
+      # address is preserved across container rebuilds. Without this, every
+      # rebuild would generate a new .onion address.
+      - ./tor-hs:/var/lib/tor/afterlife_hs
+
+    environment:
+      AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
+      AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD}
+      AFTERLIFE_DB_PATH: ${AFTERLIFE_DB_PATH:-/app/data/AFTERLIFE.db}
+      AFTERLIFE_MASTER_KEY_PATH: ${AFTERLIFE_MASTER_KEY_PATH:-/app/data/master.key}
+      AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
+      AFTERLIFE_PORT: ${AFTERLIFE_PORT:-2077}
