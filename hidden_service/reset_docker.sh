@@ -12,6 +12,7 @@ RESET="\033[0m"
 CONTAINER_NAME="afterlife-server"
 DATA_DIR="./data"
 TOR_HS_DIR="./tor-hs"
+TOR_DATA_DIR="./tor-data"
 ENV_FILE="./.env"
 
 warn() { echo -e "${YELLOW}[!] $*${RESET}"; }
@@ -27,6 +28,7 @@ warn "This will permanently delete:"
 warn "  - The Docker container and image"
 warn "  - The database and master encryption key (${DATA_DIR}/)"
 warn "  - The Tor hidden service keys (${TOR_HS_DIR}/)"
+warn "  - The Tor data directory (${TOR_DATA_DIR}/)"
 warn "  - The .env file"
 warn ""
 warn "A new .onion address will be generated on next setup."
@@ -52,6 +54,9 @@ sudo rm -rf "$DATA_DIR"
 
 info "Deleting Tor hidden service keys..."
 sudo rm -rf "$TOR_HS_DIR"
+
+info "Deleting Tor data directory..."
+sudo rm -rf "$TOR_DATA_DIR"
 
 info "Deleting .env file..."
 rm -f "$ENV_FILE"
