@@ -9,6 +9,12 @@ set -e
 ONION_FILE="/var/lib/tor/afterlife_hs/hostname"
 TOR_WAIT_SECONDS=90
 SERVER_PORT="${AFTERLIFE_PORT:-2077}"
+# Validate SERVER_PORT before it is interpolated into the shell -c string below.
+# An operator setting AFTERLIFE_PORT to a non-numeric value (e.g. by editing
+# .env manually) would otherwise inject arbitrary shell commands.
+if ! [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] || (( SERVER_PORT < 1 || SERVER_PORT > 65535 )); then
+    fatal "AFTERLIFE_PORT must be a number between 1 and 65535 (got: ${SERVER_PORT})."
+fi
 SERVER_MAX_RESTARTS=20      # give up after this many consecutive crashes
 SERVER_RESTART_DELAY=3      # seconds to wait before restarting
 
