@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 # =========================
 # Configuration
 # =========================
-HOST = os.environ.get("AFTERLIFE_HOST", "127.0.0.1")
+HOST = os.environ.get("AFTERLIFE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AFTERLIFE_PORT", "2077"))
 DB_PATH = Path(os.environ.get("AFTERLIFE_DB_PATH", "./AFTERLIFE.db"))
 MASTER_KEY_PATH = Path(os.environ.get("AFTERLIFE_MASTER_KEY_PATH", "./master.key"))
@@ -40,7 +40,7 @@ MAX_MIN_REPUTATION = 999_999
 BAN_LABEL = "[banned]"
 MAX_REQUEST_LINE_BYTES = int(os.environ.get("AFTERLIFE_MAX_REQUEST_LINE_BYTES", "8192"))
 MAX_JSON_DEPTH = int(os.environ.get("AFTERLIFE_MAX_JSON_DEPTH", "16"))
-MAX_PARSE_ERRORS_PER_WINDOW = int(os.environ.get("AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW", "50"))
+MAX_PARSE_ERRORS_PER_WINDOW = int(os.environ.get("AFTERLIFE_MAX_PARSE_ERRORS_PER_WINDOW", "10"))
 MAX_CONNECTIONS = int(os.environ.get("AFTERLIFE_MAX_CONNECTIONS", "100"))
 MAX_WORKERS = int(os.environ.get("AFTERLIFE_MAX_WORKERS", "32"))
 
@@ -51,15 +51,13 @@ NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,12}$")
 RATING_CHOICES = {"positive": 1, "negative": -1}
 
 GLOBAL_WINDOW_SECONDS = 10
-GLOBAL_MAX_REQUESTS_PER_WINDOW = 500
+GLOBAL_MAX_REQUESTS_PER_WINDOW = 40
 AUTH_WINDOW_SECONDS = 300
 AUTH_FAIL_LIMIT = 5
 AUTH_LOCK_SECONDS = 300
 READ_TIMEOUT_SECONDS = 180
 SESSION_IDLE_SECONDS = 3600
 PAIR_CHANGE_COOLDOWN_SECONDS = 86400
-MESSAGE_RATE_WINDOW_SECONDS = 30    # sliding window for per-session message rate limit
-MESSAGE_RATE_MAX_MESSAGES = 10      # max messages per session per window
 
 BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME")
 BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
@@ -220,7 +218,7 @@ def has_forbidden_chars(value: str) -> bool:
 
 def validate_nickname(nickname: str) -> Optional[str]:
     if not NICK_RE.fullmatch(nickname):
-        return "Nickname must be 3-12 chars and contain only letters, digits, and underscore."
+        return "Nickname must be 3-24 chars and contain only letters, digits, and underscore."
     if has_forbidden_chars(nickname):
         return "Nickname contains forbidden characters."
     return None
@@ -1031,33 +1029,23 @@ class Database:
             if self.block_exists(con, user_id, other_id):
                 return False, "Chat not found.", None
             other = con.execute("SELECT nickname FROM users WHERE id = ?", (other_id,)).fetchone()
-            # Single query: join messages with sender nicknames and read receipts.
-            # Replaces the previous N+1 pattern (2 queries per message in a loop).
             rows = con.execute(
-                """
-                SELECT
-                    m.id,
-                    m.sender_id,
-                    m.message_type,
-                    m.body_enc,
-                    m.created_at,
-                    u.nickname AS sender_nickname,
-                    CASE WHEN r.message_id IS NOT NULL THEN 1 ELSE 0 END AS is_read
-                FROM messages m
-                LEFT JOIN users u ON u.id = m.sender_id
-                LEFT JOIN message_reads r ON r.message_id = m.id AND r.user_id = ?
-                WHERE m.chat_id = ?
-                ORDER BY m.created_at ASC, m.id ASC
-                """,
-                (user_id, chat_id),
+                "SELECT id, sender_id, message_type, body_enc, created_at FROM messages WHERE chat_id = ? ORDER BY created_at ASC, id ASC",
+                (chat_id,),
             ).fetchall()
             unread_ids: list[int] = []
             items: list[dict[str, Any]] = []
             for row in rows:
-                is_read = bool(row["is_read"])
+                is_read = con.execute(
+                    "SELECT 1 FROM message_reads WHERE message_id = ? AND user_id = ?",
+                    (int(row["id"]), user_id),
+                ).fetchone() is not None
                 if (row["sender_id"] is None or int(row["sender_id"]) != user_id) and not is_read:
                     unread_ids.append(int(row["id"]))
-                sender_name = str(row["sender_nickname"]) if row["sender_nickname"] is not None else "system"
+                sender_name = "system"
+                if row["sender_id"] is not None:
+                    sender = con.execute("SELECT nickname FROM users WHERE id = ?", (int(row["sender_id"]),)).fetchone()
+                    sender_name = str(sender["nickname"]) if sender is not None else "unknown"
                 items.append(
                     {
                         "id": int(row["id"]),
@@ -1281,10 +1269,6 @@ sessions = SessionStore()
 global_limiter = SlidingWindowLimiter(GLOBAL_WINDOW_SECONDS, GLOBAL_MAX_REQUESTS_PER_WINDOW)
 login_throttle = LoginThrottle()
 parse_error_limiter = SlidingWindowLimiter(GLOBAL_WINDOW_SECONDS, MAX_PARSE_ERRORS_PER_WINDOW)
-# Per-session message rate limiter — keyed on session token so each user
-# has their own independent bucket. Prevents chat flooding even though all
-# Tor clients share the same IP (127.0.0.1) and thus the same global bucket.
-message_rate_limiter = SlidingWindowLimiter(MESSAGE_RATE_WINDOW_SECONDS, MESSAGE_RATE_MAX_MESSAGES)
 
 
 # =========================
@@ -1633,12 +1617,6 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         session, failure = require_session(request)
         if failure:
             return failure
-        # Per-session rate limit — keyed on session token, not IP, because all
-        # Tor clients share 127.0.0.1 and would otherwise share one bucket.
-        allowed_msg, retry_msg = message_rate_limiter.allow(session.token)
-        if not allowed_msg:
-            audit_log(event="message_rate_limited", action=action, ip=ip, actor_nickname=session.nickname, status="blocked", details=f"retry_after={retry_msg}s")
-            return err("Sending too fast. Slow down.", "rate_limited", retry_msg)
         try:
             chat_id = int(request.get("chat_id"))
         except Exception:

@@ -1,0 +1,20 @@
+services:
+  afterlife-server:
+    build: .
+    container_name: afterlife-server
+    restart: unless-stopped
+
+    ports:
+      - "${AFTERLIFE_EXPOSE_PORT:-2077}:2077"
+
+    volumes:
+      - ./data:/app/data
+
+    environment:
+      AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
+      AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD}
+      AFTERLIFE_DB_PATH: ${AFTERLIFE_DB_PATH:-/app/data/AFTERLIFE_space.db}
+      AFTERLIFE_MASTER_KEY_PATH: ${AFTERLIFE_MASTER_KEY_PATH:-/app/data/master.key}
+      AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
+
+    command: ["python", "server.py", "--host", "0.0.0.0", "--port", "2077"]

@@ -4,17 +4,26 @@ services:
     container_name: afterlife-server
     restart: unless-stopped
 
-    ports:
-      - "${AFTERLIFE_EXPOSE_PORT:-2077}:2077"
+    # No ports: section. The service is only reachable via the Tor hidden
+    # service. Exposing a port here would defeat the purpose.
 
     volumes:
+      # Application data: database, master key, server log.
       - ./data:/app/data
+      # Tor hidden service keys. Preserves the .onion address across rebuilds.
+      - ./tor-hs:/var/lib/tor/afterlife_hs
+      # Tor data directory: consensus, cached descriptors, state.
+      # Persisting this avoids a cold bootstrap on every restart.
+      - ./tor-data:/var/lib/tor/data
 
     environment:
       AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
       AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD}
-      AFTERLIFE_DB_PATH: ${AFTERLIFE_DB_PATH:-/app/data/AFTERLIFE_space.db}
+      AFTERLIFE_DB_PATH: ${AFTERLIFE_DB_PATH:-/app/data/AFTERLIFE.db}
       AFTERLIFE_MASTER_KEY_PATH: ${AFTERLIFE_MASTER_KEY_PATH:-/app/data/master.key}
       AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
+      AFTERLIFE_PORT: ${AFTERLIFE_PORT:-2077}
 
-    command: ["python", "server.py", "--host", "0.0.0.0", "--port", "2077"]
+    # Note: no-new-privileges:true was removed. On some VPS Docker configurations
+    # this flag prevents root inside the container from managing volume-mounted
+    # directories, causing the entrypoint to fail silently before any log output.

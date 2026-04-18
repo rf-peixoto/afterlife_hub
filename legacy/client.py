@@ -98,11 +98,7 @@ def key_value(label: str, value: str, value_color: str = WHITE) -> None:
 
 
 def boot_sequence() -> None:
-    for item in [
-        "initializing terminal shell...",
-        "routing through tor network...",
-        "establishing hidden service uplink...",
-    ]:
+    for item in ["initializing terminal shell...", "establishing plaintext uplink..."]:
         print(c(f"> {item}", DIM))
         time.sleep(BOOT_DELAY)
 
@@ -309,7 +305,7 @@ def print_blocks(blocks: list[dict[str, Any]]) -> None:
 # =========================
 def connect_prompt(args: argparse.Namespace) -> RemoteClient:
     clear()
-    section("NODE LINK // TOR HIDDEN SERVICE", "traffic routed through the onion network")
+    section("NODE LINK // PLAIN TCP", "no encryption – use in trusted networks only")
     boot_sequence()
     print(line("·"))
     host = ask(f"uplink host [{args.host}]> ", allow_blank=True) or args.host
@@ -684,7 +680,7 @@ def main_menu(client: RemoteClient) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AFTERLIFE client – Tor hidden service terminal interface. Run with proxychains.")
+    parser = argparse.ArgumentParser(description="AFTERLIFE client – plain TCP terminal interface.")
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Server host/IP (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
     return parser.parse_args()
