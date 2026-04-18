@@ -158,6 +158,9 @@ docker logs -f afterlife-server
 # Check the .onion address at any time
 docker logs afterlife-server 2>&1 | grep "Onion address"
 
+# Check the tor node connection status:
+docker logs afterlife-server 2>&1 | grep -i "introduc\|circuit\|descriptor\|hs\|rendezvous\|service"
+
 # Stop the server
 docker compose down
 
