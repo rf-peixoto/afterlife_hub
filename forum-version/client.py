@@ -58,6 +58,19 @@ def wrap(text: str, indent: str = "") -> str:
     return "\n".join(indent + part for part in textwrap.wrap(text, width=width)) if text else ""
 
 
+def wrap_block(text: str, indent: str = "") -> str:
+    """Wrap multi-line text while preserving the author's own line breaks."""
+    if not text:
+        return ""
+    out: list[str] = []
+    for raw_line in text.split("\n"):
+        if raw_line.strip() == "":
+            out.append(indent.rstrip())
+        else:
+            out.append(wrap(raw_line, indent=indent))
+    return "\n".join(out)
+
+
 def fmt_ts(ts: Optional[int]) -> str:
     if not ts:
         return "-"
@@ -177,6 +190,29 @@ def yes_no(prompt_text: str) -> bool:
         if value in {"n", "no"}:
             return False
         print(c("answer with yes or no.", RED))
+
+
+def ask_multiline(prompt_text: str) -> Optional[str]:
+    """Collect a multi-line block. End with a single '.' on its own line.
+    Type '/cancel' on its own line to abort (returns None)."""
+    print(prompt(prompt_text))
+    print(c("  (type your text; finish with a single '.' on a line, or '/cancel' to abort)", DIM))
+    lines: list[str] = []
+    while True:
+        try:
+            raw = input()
+        except EOFError:
+            break
+        if raw.strip() == "/cancel":
+            return None
+        if raw.strip() == ".":
+            break
+        lines.append(raw)
+    text = "\n".join(lines).strip()
+    if not text:
+        print(c("input required.", RED))
+        return ""
+    return text
 
 
 def normalize_choice(value: str) -> str:
@@ -302,6 +338,41 @@ def print_blocks(blocks: list[dict[str, Any]]) -> None:
     for item in blocks:
         print(c(str(item["nickname"]), WHITE + BOLD) + c(f"  rep={item['reputation']}", DIM))
     print(line())
+
+
+def print_threads(threads: list[dict[str, Any]], heading: Optional[str] = None) -> None:
+    if heading:
+        print(c(heading, CYAN))
+        print(line("·"))
+    if not threads:
+        print(c("no threads found.", YELLOW))
+        return
+    for th in threads:
+        print(c(f"[ THREAD #{int(th['id']):04d} ]", CYAN + BOLD) + c(f"  {th['title']}", WHITE + BOLD))
+        key_value("Author", str(th.get("author_display") or th.get("author_nickname", "?")))
+        key_value("Replies", str(th.get("reply_count", 0)))
+        key_value("Last activity", fmt_ts(th.get("updated_at")))
+        print(line())
+
+
+def print_thread_detail(data: dict[str, Any]) -> None:
+    print(c(f"[ THREAD #{int(data['id']):04d} ]", MAGENTA + BOLD))
+    print(line("═", CYAN))
+    print(c(str(data["title"]), WHITE + BOLD))
+    key_value("Author", str(data.get("author_display") or data["author_nickname"]))
+    key_value("Posted", fmt_ts(data.get("created_at")))
+    print(line("·"))
+    print(wrap_block(str(data.get("body") or ""), indent="  "))
+    print()
+    posts = data.get("posts", [])
+    print(c(f"[ REPLIES // {len(posts)} ]", CYAN))
+    if not posts:
+        print(c("  no replies yet.", DIM))
+        return
+    for p in posts:
+        print(c(f"  #{int(p['id']):04d}  {fmt_ts(p.get('created_at'))}  {p.get('author_display') or p.get('author_nickname')}", WHITE + BOLD))
+        print(wrap_block(str(p.get("body") or ""), indent="    "))
+        print(c("  " + hr("·"), DIM))
 
 
 # =========================
@@ -611,6 +682,101 @@ def ban_user_menu(client: RemoteClient) -> None:
     pause()
 
 
+def view_thread(client: RemoteClient, thread_id: int) -> None:
+    while True:
+        response = client.request({"action": "thread_details", "thread_id": thread_id})
+        if not response.get("ok"):
+            show_result(response)
+            pause()
+            return
+        data = response["data"]
+        clear()
+        section("FORUM // THREAD VIEW")
+        print_thread_detail(data)
+        print(line("═", CYAN))
+        commands = ["back"]
+        if client.session_token:
+            commands.append("comment")
+        if data.get("is_admin"):
+            commands.extend(["delete thread", "delete comment"])
+        print(c("commands: " + ", ".join(commands), CYAN))
+        choice = choose("thread@view> ", {k: k for k in commands})
+        if choice == "comment":
+            body = ask_multiline("reply>")
+            if body is None:
+                print(c("reply cancelled.", YELLOW))
+                pause()
+                continue
+            if body == "":
+                pause()
+                continue
+            show_result(client.request({"action": "post_comment", "thread_id": thread_id, "body": body}))
+            pause()
+        elif choice == "delete thread":
+            if yes_no(f"delete thread #{thread_id} permanently? [yes/no]> "):
+                resp = client.request({"action": "delete_thread", "thread_id": thread_id})
+                show_result(resp)
+                pause()
+                if resp.get("ok"):
+                    return
+        elif choice == "delete comment":
+            comment_id = ask_int("comment id to delete> ")
+            show_result(client.request({"action": "delete_comment", "comment_id": comment_id}))
+            pause()
+        else:
+            return
+
+
+def forum_menu(client: RemoteClient) -> None:
+    while True:
+        clear()
+        section("FORUM // COMMUNITY BOARD", "text-only threads — no emoji, no images")
+        response = client.request({"action": "list_threads"})
+        if not response.get("ok"):
+            show_result(response)
+            pause()
+            return
+        print_threads(response["data"].get("threads", []))
+        print(c("commands: view, create, search, back", CYAN))
+        choice = choose("forum@node> ", {"view": "view", "create": "create", "search": "search", "back": "back"})
+        if choice == "view":
+            thread_id = ask_int("thread id> ")
+            view_thread(client, thread_id)
+        elif choice == "create":
+            clear()
+            section("FORUM // NEW THREAD")
+            print(c("forbidden characters in text: ' \" \\ / % +", DIM))
+            print(line("·"))
+            title = ask("title> ")
+            body = ask_multiline("body>")
+            if body is None:
+                print(c("thread cancelled.", YELLOW))
+                pause()
+                continue
+            if body == "":
+                pause()
+                continue
+            resp = client.request({"action": "create_thread", "title": title, "body": body})
+            show_result(resp)
+            if resp.get("ok") and resp.get("data"):
+                key_value("Thread", str(resp["data"].get("thread_id")), GREEN)
+            pause()
+        elif choice == "search":
+            clear()
+            section("FORUM // SEARCH THREADS")
+            query = ask("search query> ")
+            resp = client.request({"action": "search_threads", "query": query})
+            if resp.get("ok"):
+                clear()
+                section("FORUM // SEARCH RESULTS")
+                print_threads(resp["data"].get("threads", []), heading=f"results for: {query}")
+            else:
+                show_result(resp)
+            pause()
+        else:
+            return
+
+
 def main_menu(client: RemoteClient) -> None:
     choices = {
         "open jobs": "open jobs",
@@ -631,6 +797,7 @@ def main_menu(client: RemoteClient) -> None:
         "rate": "rate",
         "blocks": "blocks",
         "chats": "chats",
+        "forum": "forum",
         "ban": "ban",
         "logout": "logout",
         "quit": "quit",
@@ -641,7 +808,7 @@ def main_menu(client: RemoteClient) -> None:
         section("MAIN GRID // OPERATOR CONSOLE")
         operator_label = (client.nickname or "unknown") + (" [admin]" if client.is_admin else "")
         key_value("Operator", operator_label, GREEN)
-        print(c("commands: open jobs, done jobs, cancelled jobs, create job, job details, my authored jobs, my accepted, profile, rate, blocks, chats" + (", ban" if client.is_admin else "") + ", logout, quit", CYAN))
+        print(c("commands: open jobs, done jobs, cancelled jobs, create job, job details, my authored jobs, my accepted, profile, rate, blocks, chats, forum" + (", ban" if client.is_admin else "") + ", logout, quit", CYAN))
         print(line("·"))
         choice = choose("afterlife@node> ", choices)
         if choice == "open jobs":
@@ -666,6 +833,8 @@ def main_menu(client: RemoteClient) -> None:
             blocks_menu(client)
         elif choice == "chats":
             chats_menu(client)
+        elif choice == "forum":
+            forum_menu(client)
         elif choice == "ban":
             if client.is_admin:
                 ban_user_menu(client)

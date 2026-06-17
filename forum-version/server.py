@@ -32,6 +32,14 @@ LOG_PATH = Path(os.environ.get("AFTERLIFE_LOG_PATH", "./server.log"))
 MAX_TITLE_LEN = 32
 MAX_DESC_LEN = 256
 MAX_MESSAGE_LEN = 128
+# Forum limits. Thread titles are single-line; bodies and comments are
+# multi-line (newlines permitted) but otherwise share the same restricted,
+# text-only character policy as the rest of the platform — no emoji, no images.
+MAX_THREAD_TITLE_LEN = 100
+MAX_THREAD_BODY_LEN = 4000
+MAX_COMMENT_LEN = 1000
+MAX_SEARCH_QUERY_LEN = 64
+MAX_SEARCH_RESULTS = 50
 MIN_NICK_LEN = 3
 MAX_NICK_LEN = 12
 MIN_PASSWORD_LEN = 8
@@ -47,6 +55,14 @@ MAX_WORKERS = int(os.environ.get("AFTERLIFE_MAX_WORKERS", "32"))
 FORBIDDEN_CHARS = set("'\"\\/%+")
 ALLOWED_TEXT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,256}$")
 MESSAGE_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,128}$")
+# Forum text. Titles and search queries are single-line and reuse the base
+# charset. Bodies/comments additionally permit newlines so posts can span
+# multiple lines, but the character class is otherwise identical — still
+# ASCII-only, which inherently excludes emoji and any binary/image payloads.
+THREAD_TITLE_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,100}$")
+THREAD_BODY_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@\n]{1,4000}$")
+COMMENT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@\n]{1,1000}$")
+SEARCH_QUERY_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,64}$")
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,12}$")
 RATING_CHOICES = {"positive": 1, "negative": -1}
 
@@ -262,6 +278,46 @@ def validate_message_text(message: str) -> Optional[str]:
     return None
 
 
+def validate_thread_title(title: str) -> Optional[str]:
+    if not title or len(title) > MAX_THREAD_TITLE_LEN:
+        return f"Thread title must be 1-{MAX_THREAD_TITLE_LEN} characters."
+    if has_forbidden_chars(title):
+        return "Thread title contains forbidden characters."
+    if not THREAD_TITLE_RE.fullmatch(title):
+        return "Thread title contains unsupported characters."
+    return None
+
+
+def validate_thread_body(body: str) -> Optional[str]:
+    if not body or len(body) > MAX_THREAD_BODY_LEN:
+        return f"Thread body must be 1-{MAX_THREAD_BODY_LEN} characters."
+    if has_forbidden_chars(body):
+        return "Thread body contains forbidden characters."
+    if not THREAD_BODY_RE.fullmatch(body):
+        return "Thread body contains unsupported characters (text only, no emoji or images)."
+    return None
+
+
+def validate_comment_text(body: str) -> Optional[str]:
+    if not body or len(body) > MAX_COMMENT_LEN:
+        return f"Comment must be 1-{MAX_COMMENT_LEN} characters."
+    if has_forbidden_chars(body):
+        return "Comment contains forbidden characters."
+    if not COMMENT_RE.fullmatch(body):
+        return "Comment contains unsupported characters (text only, no emoji or images)."
+    return None
+
+
+def validate_search_query(query: str) -> Optional[str]:
+    if not query or len(query) > MAX_SEARCH_QUERY_LEN:
+        return f"Search query must be 1-{MAX_SEARCH_QUERY_LEN} characters."
+    if has_forbidden_chars(query):
+        return "Search query contains forbidden characters."
+    if not SEARCH_QUERY_RE.fullmatch(query):
+        return "Search query contains unsupported characters."
+    return None
+
+
 def validate_reward(raw: str) -> Optional[str]:
     if not raw.isdigit():
         return "Reward must contain digits only."
@@ -434,6 +490,26 @@ class Database:
                     PRIMARY KEY (message_id, user_id),
                     FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS threads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    author_id INTEGER NOT NULL,
+                    title_enc TEXT NOT NULL,
+                    body_enc TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS thread_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id INTEGER NOT NULL,
+                    author_id INTEGER,
+                    body_enc TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE,
+                    FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE SET NULL
                 );
                 """
             )
@@ -1131,6 +1207,198 @@ class Database:
             con.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now, chat_id))
             return True, "Message sent.", int(cur.lastrowid)
 
+    # =========================
+    # Forum
+    # =========================
+    def _user_can_post(self, con: sqlite3.Connection, user_id: int) -> tuple[bool, str]:
+        """Gate for creating threads and comments.
+
+        Negative-reputation users are blocked from posting, mirroring the
+        platform's reputation-gating philosophy. Banned users are blocked too.
+        """
+        row = con.execute("SELECT reputation, is_banned FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None or bool(row["is_banned"]):
+            return False, "Not allowed."
+        if int(row["reputation"]) < 0:
+            return False, "Negative reputation users cannot post or comment on threads."
+        return True, "OK"
+
+    def _thread_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        author_is_banned = bool(row["author_is_banned"]) if "author_is_banned" in row.keys() else False
+        author_nickname = str(row["author_nickname"])
+        author_display = f"{BAN_LABEL} {author_nickname}" if author_is_banned else author_nickname
+        return {
+            "id": int(row["id"]),
+            "title": get_crypto().dec(row["title_enc"]),
+            "author_id": int(row["author_id"]),
+            "author_nickname": author_nickname,
+            "author_is_banned": author_is_banned,
+            "author_display": author_display,
+            "reply_count": int(row["reply_count"]) if "reply_count" in row.keys() else 0,
+            "created_at": int(row["created_at"]),
+            "updated_at": int(row["updated_at"]),
+        }
+
+    def create_thread(self, author_id: int, title: str, body: str) -> tuple[bool, str, Optional[int]]:
+        now = int(time.time())
+        with self.lock, self.conn() as con:
+            allowed, reason = self._user_can_post(con, author_id)
+            if not allowed:
+                return False, reason, None
+            cur = con.execute(
+                "INSERT INTO threads (author_id, title_enc, body_enc, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (author_id, get_crypto().enc(title), get_crypto().enc(body), now, now),
+            )
+            return True, "Thread created.", int(cur.lastrowid)
+
+    def _thread_block_clause(self, viewer_id: Optional[int]) -> tuple[str, list[Any]]:
+        """Block filter for thread listings — identical pattern to list_jobs."""
+        if viewer_id is None:
+            return "", []
+        clause = (
+            "NOT EXISTS (SELECT 1 FROM user_blocks b WHERE "
+            "(b.blocker_id = ? AND b.blocked_id = t.author_id) OR "
+            "(b.blocker_id = t.author_id AND b.blocked_id = ?))"
+        )
+        return clause, [viewer_id, viewer_id]
+
+    def list_threads(self, viewer_id: Optional[int]) -> list[dict[str, Any]]:
+        with self.lock, self.conn() as con:
+            query = (
+                "SELECT t.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned, "
+                "(SELECT COUNT(*) FROM thread_posts p WHERE p.thread_id = t.id) AS reply_count "
+                "FROM threads t JOIN users u ON u.id = t.author_id "
+            )
+            clause, params = self._thread_block_clause(viewer_id)
+            if clause:
+                query += "WHERE " + clause + " "
+            query += "ORDER BY t.updated_at DESC"
+            rows = con.execute(query, params).fetchall()
+            return [self._thread_row_to_dict(row) for row in rows]
+
+    def search_threads(self, viewer_id: Optional[int], query_text: str) -> list[dict[str, Any]]:
+        """Substring search over thread titles and bodies.
+
+        Titles and bodies are Fernet-encrypted at rest (non-deterministic
+        ciphertext), so SQL LIKE cannot be used. We decrypt candidate rows in
+        memory and filter there. Block filtering is applied in SQL exactly as
+        in list_threads; results are capped at MAX_SEARCH_RESULTS.
+        """
+        needle = query_text.lower()
+        with self.lock, self.conn() as con:
+            base = (
+                "SELECT t.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned, "
+                "(SELECT COUNT(*) FROM thread_posts p WHERE p.thread_id = t.id) AS reply_count "
+                "FROM threads t JOIN users u ON u.id = t.author_id "
+            )
+            clause, params = self._thread_block_clause(viewer_id)
+            if clause:
+                base += "WHERE " + clause + " "
+            base += "ORDER BY t.updated_at DESC"
+            rows = con.execute(base, params).fetchall()
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                title = get_crypto().dec(row["title_enc"])
+                body = get_crypto().dec(row["body_enc"])
+                if needle in title.lower() or needle in body.lower():
+                    results.append(self._thread_row_to_dict(row))
+                    if len(results) >= MAX_SEARCH_RESULTS:
+                        break
+            return results
+
+    def get_thread_for_viewer(self, thread_id: int, viewer_id: Optional[int]) -> tuple[bool, str, Optional[dict[str, Any]]]:
+        with self.lock, self.conn() as con:
+            row = con.execute(
+                "SELECT t.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned "
+                "FROM threads t JOIN users u ON u.id = t.author_id WHERE t.id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                return False, "Thread not found.", None
+            viewer = self.get_user(viewer_id) if viewer_id else None
+            is_admin = bool(viewer and viewer["is_admin"])
+            is_author = bool(viewer_id and int(row["author_id"]) == viewer_id)
+            if viewer_id is not None and not is_author and not is_admin and self.block_exists(con, viewer_id, int(row["author_id"])):
+                return False, "Thread not found.", None
+            data = self._thread_row_to_dict(row)
+            data["body"] = get_crypto().dec(row["body_enc"])
+            data["is_author"] = is_author
+            data["is_admin"] = is_admin
+            post_rows = con.execute(
+                "SELECT p.id, p.author_id, p.body_enc, p.created_at, "
+                "u.nickname AS author_nickname, u.is_banned AS author_is_banned "
+                "FROM thread_posts p LEFT JOIN users u ON u.id = p.author_id "
+                "WHERE p.thread_id = ? ORDER BY p.created_at ASC, p.id ASC",
+                (thread_id,),
+            ).fetchall()
+            posts: list[dict[str, Any]] = []
+            for p in post_rows:
+                p_author_id = int(p["author_id"]) if p["author_id"] is not None else None
+                # Hide replies authored by users in a block relation with the
+                # viewer (either direction), unless the viewer is an admin.
+                if (
+                    viewer_id is not None
+                    and not is_admin
+                    and p_author_id is not None
+                    and p_author_id != viewer_id
+                    and self.block_exists(con, viewer_id, p_author_id)
+                ):
+                    continue
+                author_nick = str(p["author_nickname"]) if p["author_nickname"] is not None else "[deleted user]"
+                author_banned = bool(p["author_is_banned"]) if p["author_is_banned"] is not None else False
+                posts.append(
+                    {
+                        "id": int(p["id"]),
+                        "author_id": p_author_id,
+                        "author_nickname": author_nick,
+                        "author_display": f"{BAN_LABEL} {author_nick}" if author_banned else author_nick,
+                        "body": get_crypto().dec(p["body_enc"]),
+                        "created_at": int(p["created_at"]),
+                    }
+                )
+            data["posts"] = posts
+            return True, "OK", data
+
+    def add_thread_post(self, thread_id: int, author_id: int, body: str) -> tuple[bool, str, Optional[int]]:
+        now = int(time.time())
+        with self.lock, self.conn() as con:
+            allowed, reason = self._user_can_post(con, author_id)
+            if not allowed:
+                return False, reason, None
+            thread = con.execute("SELECT id, author_id FROM threads WHERE id = ?", (thread_id,)).fetchone()
+            if thread is None:
+                return False, "Thread not found.", None
+            # Respect blocks: cannot comment on a thread whose author is in a
+            # block relation with you (either direction).
+            if self.block_exists(con, author_id, int(thread["author_id"])):
+                return False, "Not allowed.", None
+            cur = con.execute(
+                "INSERT INTO thread_posts (thread_id, author_id, body_enc, created_at) VALUES (?, ?, ?, ?)",
+                (thread_id, author_id, get_crypto().enc(body), now),
+            )
+            con.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now, thread_id))
+            return True, "Comment posted.", int(cur.lastrowid)
+
+    def delete_thread(self, actor_id: int, thread_id: int) -> tuple[bool, str]:
+        with self.lock, self.conn() as con:
+            actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
+            if actor is None or not bool(actor["is_admin"]):
+                return False, "Not allowed."
+            cur = con.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
+            if cur.rowcount == 0:
+                return False, "Thread not found."
+            return True, "Thread deleted."
+
+    def delete_thread_post(self, actor_id: int, post_id: int) -> tuple[bool, str]:
+        with self.lock, self.conn() as con:
+            actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
+            if actor is None or not bool(actor["is_admin"]):
+                return False, "Not allowed."
+            cur = con.execute("DELETE FROM thread_posts WHERE id = ?", (post_id,))
+            if cur.rowcount == 0:
+                return False, "Comment not found."
+            return True, "Comment deleted."
+
 
 db: Database
 
@@ -1333,6 +1601,13 @@ VALID_ACTIONS = {
     "list_messages",
     "read_message",
     "send_message",
+    "create_thread",
+    "list_threads",
+    "search_threads",
+    "thread_details",
+    "post_comment",
+    "delete_thread",
+    "delete_comment",
 }
 
 
@@ -1650,6 +1925,84 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         success, message, message_id = get_db().send_message(session.user_id, chat_id, body)
         audit_log(event="message_send", action=action, ip=ip, actor_nickname=session.nickname, chat_id=chat_id, status="success" if success else "fail", details=message)
         return ok({"message_id": message_id}, message) if success else err(message, "send_failed")
+
+    if action == "create_thread":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        title = str(request.get("title", "")).strip()
+        body = str(request.get("body", "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+        problem = validate_thread_title(title) or validate_thread_body(body)
+        if problem:
+            return err(problem, "validation_error")
+        success, message, thread_id = get_db().create_thread(session.user_id, title, body)
+        audit_log(event="thread_create", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        return ok({"thread_id": thread_id}, message) if success else err(message, "thread_failed")
+
+    if action == "list_threads":
+        session = sessions.get(request.get("session_token"))
+        viewer_id = session.user_id if session else None
+        return ok({"threads": get_db().list_threads(viewer_id=viewer_id)})
+
+    if action == "search_threads":
+        session = sessions.get(request.get("session_token"))
+        viewer_id = session.user_id if session else None
+        query_text = str(request.get("query", "")).strip()
+        problem = validate_search_query(query_text)
+        if problem:
+            return err(problem, "validation_error")
+        results = get_db().search_threads(viewer_id=viewer_id, query_text=query_text)
+        return ok({"threads": results, "query": query_text})
+
+    if action == "thread_details":
+        try:
+            thread_id_int = int(request.get("thread_id"))
+        except Exception:
+            return err("Invalid thread id.", "validation_error")
+        session = sessions.get(request.get("session_token"))
+        viewer_id = session.user_id if session else None
+        success, message, data = get_db().get_thread_for_viewer(thread_id_int, viewer_id)
+        return ok(data, message) if success and data is not None else err(message, "not_found")
+
+    if action == "post_comment":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        try:
+            thread_id = int(request.get("thread_id"))
+        except Exception:
+            return err("Invalid thread id.", "validation_error")
+        body = str(request.get("body", "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+        problem = validate_comment_text(body)
+        if problem:
+            return err(problem, "validation_error")
+        success, message, post_id = get_db().add_thread_post(thread_id, session.user_id, body)
+        audit_log(event="thread_comment", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        return ok({"comment_id": post_id}, message) if success else err(message, "comment_failed")
+
+    if action == "delete_thread":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        try:
+            thread_id = int(request.get("thread_id"))
+        except Exception:
+            return err("Invalid thread id.", "validation_error")
+        success, message = get_db().delete_thread(session.user_id, thread_id)
+        audit_log(event="thread_delete", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        return ok(message=message) if success else err(message, "delete_failed")
+
+    if action == "delete_comment":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        try:
+            comment_id = int(request.get("comment_id"))
+        except Exception:
+            return err("Invalid comment id.", "validation_error")
+        success, message = get_db().delete_thread_post(session.user_id, comment_id)
+        audit_log(event="comment_delete", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        return ok(message=message) if success else err(message, "delete_failed")
 
     return err("Unknown action.", "unknown_action")
 

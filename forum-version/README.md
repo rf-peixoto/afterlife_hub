@@ -24,10 +24,12 @@ address; traffic never leaves the Tor overlay.
 - Reputation-gated jobs (author sets a minimum reputation to accept)
 - Accept / withdraw job workflows
 - Authored and accepted job tracking
+- Community forum: text-only threads and comments, with keyword search
+- Reputation-gated forum (negative-reputation users cannot post or comment)
 - Direct encrypted chat between participants
-- Block list and user isolation
+- Block list and user isolation (applies to jobs, chat, and the forum)
 - User rating and reputation system
-- Admin moderation: ban users, delete jobs, terminate sessions
+- Admin moderation: ban users, delete jobs, delete threads/comments, terminate sessions
 - Structured audit logging
 - Per-IP rate limiting, login throttling, request validation
 - Fernet encryption at rest for all sensitive fields
@@ -250,6 +252,38 @@ they need.
 | `[proxychains] Dynamic chain ... FAILED` | Wrong SOCKS port in proxychains.conf, or Tor is using a different port. |
 | `[CONNECTION FAILURE] timed out` | The server is down, or the .onion address is wrong. Check `docker logs afterlife-server`. |
 | `[CONNECTION FAILURE] connection refused` | The server is running but not accepting on that port. Verify `--port` matches the server. |
+
+---
+
+## Forum
+
+AFTERLIFE includes a simplified, MyBB-style community board reachable from the
+main menu via the `forum` command. It is a single flat board of threads — no
+categories, no sub-forums.
+
+- **Threads** — any member can start a thread with a title and a body. Bodies
+  may span multiple lines. In the client, finish a body with a single `.` on
+  its own line (or type `/cancel` to abort).
+- **Comments** — members reply to threads with text comments. Threads are
+  ordered by most recent activity.
+- **Search** — keyword search matches thread titles and bodies (case
+  insensitive substring match).
+- **Text only** — titles, bodies, and comments are restricted to the same
+  ASCII text policy as the rest of the platform. Emoji, images, and the
+  forbidden characters `' " \ / % +` are rejected.
+- **Reputation gate** — users with negative reputation can read and search the
+  forum but cannot create threads or comment. Banned users cannot post at all.
+- **Isolation** — the existing block system applies. Threads and replies from
+  users you have blocked (in either direction) are hidden from you.
+- **Encryption at rest** — thread titles, bodies, and comments are Fernet
+  encrypted in the database exactly like job and chat content. Because the
+  ciphertext is non-deterministic, search decrypts candidate rows in memory
+  rather than querying plaintext.
+- **Moderation** — admins can delete any thread (which removes its comments)
+  or any individual comment.
+
+Reading threads is the only forum capability available without logging in;
+posting, commenting, and moderation all require an authenticated session.
 
 ---
 
