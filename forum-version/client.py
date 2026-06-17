@@ -626,39 +626,37 @@ def chats_menu(client: RemoteClient) -> None:
             show_result(response)
             pause()
             return
-        print_chats(response["data"].get("chats", []))
-        print(c("commands: open, view, read, send, back", CYAN))
-        choice = choose("chat@node> ", {"open": "open", "view": "view", "read": "read", "send": "send", "back": "back"})
-        if choice == "open":
-            nickname = ask("chat <nickname> > ")
-            resp = client.request({"action": "open_chat", "nickname": nickname})
-            show_result(resp)
-            if resp.get("ok") and resp.get("data"):
-                key_value("Chat", str(resp["data"].get("chat_id")), GREEN)
-            pause()
-        elif choice == "view":
-            chat_id = ask_int("chat id> ")
+        chats = response["data"].get("chats", [])
+        print_chats(chats)
+        existing_ids = {int(ch["chat_id"]) for ch in chats}
+        print(c("commands: view, send, back", CYAN))
+        print(c("(view takes a chat id from the list, or a nickname to open/start a chat)", DIM))
+        choice = choose("chat@node> ", {"view": "view", "send": "send", "back": "back"})
+        if choice == "view":
+            target = ask("chat id or nickname> ")
+            chat_id: Optional[int] = None
+            if target.isdigit() and int(target) in existing_ids:
+                # Existing conversation, selected by its id from the list.
+                chat_id = int(target)
+            else:
+                # Treat as a nickname: ensure a chat exists, then view it. This
+                # folds the old "open" command into "view".
+                resp = client.request({"action": "open_chat", "nickname": target})
+                if not resp.get("ok"):
+                    show_result(resp)
+                    pause()
+                    continue
+                chat_id = (resp.get("data") or {}).get("chat_id")
+            # Viewing the conversation lists every message and marks them read,
+            # which makes the old single-message "read" command unnecessary.
             resp = client.request({"action": "list_messages", "chat_id": chat_id})
             if resp.get("ok"):
                 clear()
                 section("PRIVATE MESSAGES // CHAT VIEW")
                 print_messages(resp["data"])
-            else:
-                show_result(resp)
-            pause()
-        elif choice == "read":
-            message_id = ask_int("message id> ")
-            resp = client.request({"action": "read_message", "message_id": message_id})
-            if resp.get("ok"):
-                data = resp["data"]
-                clear()
-                section("PRIVATE MESSAGES // SINGLE MESSAGE")
-                key_value("Message id", str(data["id"]))
-                key_value("Chat", str(data["chat_id"]))
-                key_value("From", str(data["sender_nickname"]))
-                key_value("When", fmt_ts(data.get("created_at")))
                 print(line("·"))
-                print(wrap(str(data.get("body") or ""), indent="  "))
+                key_value("Chat id", str(chat_id), GREEN)
+                print(c("use 'send' with this chat id to reply.", DIM))
             else:
                 show_result(resp)
             pause()
@@ -677,6 +675,20 @@ def ban_user_menu(client: RemoteClient) -> None:
     nickname = ask("nickname to ban> ")
     if yes_no(f"ban {nickname} permanently? [yes/no]> "):
         show_result(client.request({"action": "ban_user", "nickname": nickname}))
+    else:
+        print(c("operation cancelled.", YELLOW))
+    pause()
+
+
+def wipe_user_menu(client: RemoteClient) -> None:
+    clear()
+    section("ADMIN WIPE // PURGE CONTENT")
+    print(c("wipe = ban the account AND delete all of its jobs, threads, and comments.", DIM))
+    print(c("the account row itself and existing chats are preserved.", DIM))
+    print(line("·"))
+    nickname = ask("nickname to wipe> ")
+    if yes_no(f"wipe {nickname} (ban + delete all their jobs/threads/comments)? [yes/no]> "):
+        show_result(client.request({"action": "wipe_user", "nickname": nickname}))
     else:
         print(c("operation cancelled.", YELLOW))
     pause()
@@ -799,6 +811,7 @@ def main_menu(client: RemoteClient) -> None:
         "chats": "chats",
         "forum": "forum",
         "ban": "ban",
+        "wipe": "wipe",
         "logout": "logout",
         "quit": "quit",
         "exit": "quit",
@@ -808,7 +821,7 @@ def main_menu(client: RemoteClient) -> None:
         section("MAIN GRID // OPERATOR CONSOLE")
         operator_label = (client.nickname or "unknown") + (" [admin]" if client.is_admin else "")
         key_value("Operator", operator_label, GREEN)
-        print(c("commands: open jobs, done jobs, cancelled jobs, create job, job details, my authored jobs, my accepted, profile, rate, blocks, chats, forum" + (", ban" if client.is_admin else "") + ", logout, quit", CYAN))
+        print(c("commands: open jobs, done jobs, cancelled jobs, create job, job details, my authored jobs, my accepted, profile, rate, blocks, chats, forum" + (", ban, wipe" if client.is_admin else "") + ", logout, quit", CYAN))
         print(line("·"))
         choice = choose("afterlife@node> ", choices)
         if choice == "open jobs":
@@ -838,6 +851,12 @@ def main_menu(client: RemoteClient) -> None:
         elif choice == "ban":
             if client.is_admin:
                 ban_user_menu(client)
+            else:
+                print(c("admin only option.", RED))
+                pause()
+        elif choice == "wipe":
+            if client.is_admin:
+                wipe_user_menu(client)
             else:
                 print(c("admin only option.", RED))
                 pause()

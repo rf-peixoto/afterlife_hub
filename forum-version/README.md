@@ -29,7 +29,7 @@ address; traffic never leaves the Tor overlay.
 - Direct encrypted chat between participants
 - Block list and user isolation (applies to jobs, chat, and the forum)
 - User rating and reputation system
-- Admin moderation: ban users, delete jobs, delete threads/comments, terminate sessions
+- Admin moderation: ban users, wipe users (ban + purge their content), delete jobs, delete threads/comments, terminate sessions
 - Structured audit logging
 - Per-IP rate limiting, login throttling, request validation
 - Fernet encryption at rest for all sensitive fields
@@ -262,8 +262,8 @@ main menu via the `forum` command. It is a single flat board of threads — no
 categories, no sub-forums.
 
 - **Threads** — any member can start a thread with a title and a body. Bodies
-  may span multiple lines. In the client, finish a body with a single `.` on
-  its own line (or type `/cancel` to abort).
+  may span multiple lines (up to 2096 characters). In the client, finish a body
+  with a single `.` on its own line (or type `/cancel` to abort).
 - **Comments** — members reply to threads with text comments. Threads are
   ordered by most recent activity.
 - **Search** — keyword search matches thread titles and bodies (case
@@ -271,8 +271,9 @@ categories, no sub-forums.
 - **Text only** — titles, bodies, and comments are restricted to the same
   ASCII text policy as the rest of the platform. Emoji, images, and the
   forbidden characters `' " \ / % +` are rejected.
-- **Reputation gate** — users with negative reputation can read and search the
-  forum but cannot create threads or comment. Banned users cannot post at all.
+- **Reputation gate** — users whose reputation has dropped to -10 or below can
+  read and search the forum but cannot create threads or comment. Banned users
+  cannot post at all.
 - **Isolation** — the existing block system applies. Threads and replies from
   users you have blocked (in either direction) are hidden from you.
 - **Encryption at rest** — thread titles, bodies, and comments are Fernet
@@ -282,8 +283,8 @@ categories, no sub-forums.
 - **Moderation** — admins can delete any thread (which removes its comments)
   or any individual comment.
 
-Reading threads is the only forum capability available without logging in;
-posting, commenting, and moderation all require an authenticated session.
+Every action except `ping`, `register`, and `login` requires an authenticated
+session — there is no anonymous browsing anywhere on the platform.
 
 ---
 
@@ -299,6 +300,18 @@ posting, commenting, and moderation all require an authenticated session.
 - The server never logs passwords or session tokens.
 - Rate limiting and login throttling are active. Brute force attempts are
   blocked per IP and per `IP + nickname` pair.
+- All actions except `ping`, `register`, and `login` require an authenticated
+  session. Because every Tor client reaches the server from `127.0.0.1`, a
+  general per-session rate limiter (keyed on the session token) throttles each
+  user independently of the shared global IP bucket. Forum writes and the
+  (decrypt-heavy) thread search have their own stricter per-session limiters.
+- Passwords are bounded to 8–64 characters; an over-length password at login is
+  rejected before any hashing, closing a cheap CPU-exhaustion vector.
+- Moderation is auditable: thread/comment IDs are recorded on create, comment,
+  and delete events, and an unusual burst of negative ratings against a single
+  user (more than five within 24 hours) raises an audit warning.
+- Admins can `wipe_user`: this bans the account and deletes all of its jobs,
+  threads, and comments while preserving the account row and existing chats.
 - Sessions are single-instance per user — logging in from a new location
   invalidates the previous session.
 

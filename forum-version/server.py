@@ -36,13 +36,15 @@ MAX_MESSAGE_LEN = 128
 # multi-line (newlines permitted) but otherwise share the same restricted,
 # text-only character policy as the rest of the platform — no emoji, no images.
 MAX_THREAD_TITLE_LEN = 100
-MAX_THREAD_BODY_LEN = 4000
+MAX_THREAD_BODY_LEN = 2096
+MAX_THREAD_BODY_BYTES = 4096
 MAX_COMMENT_LEN = 1000
 MAX_SEARCH_QUERY_LEN = 64
 MAX_SEARCH_RESULTS = 50
 MIN_NICK_LEN = 3
 MAX_NICK_LEN = 12
 MIN_PASSWORD_LEN = 8
+MAX_PASSWORD_LEN = 64
 MAX_REWARD = 99_999_999
 MAX_MIN_REPUTATION = 999_999
 BAN_LABEL = "[banned]"
@@ -60,7 +62,7 @@ MESSAGE_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,128}$")
 # multiple lines, but the character class is otherwise identical — still
 # ASCII-only, which inherently excludes emoji and any binary/image payloads.
 THREAD_TITLE_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,100}$")
-THREAD_BODY_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@\n]{1,4000}$")
+THREAD_BODY_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@\n]{1,2096}$")
 COMMENT_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@\n]{1,1000}$")
 SEARCH_QUERY_RE = re.compile(r"^[A-Za-z0-9 _.,:;!?()\-\[\]@]{1,64}$")
 NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,12}$")
@@ -76,6 +78,25 @@ SESSION_IDLE_SECONDS = 3600
 PAIR_CHANGE_COOLDOWN_SECONDS = 86400
 MESSAGE_RATE_WINDOW_SECONDS = 30    # sliding window for per-session message rate limit
 MESSAGE_RATE_MAX_MESSAGES = 10      # max messages per session per window
+
+# General per-session request limiter. Applied to EVERY authenticated action
+# (via require_session) so that, even though all Tor clients share 127.0.0.1
+# and thus the global IP bucket, each session is independently throttled.
+SESSION_RATE_WINDOW_SECONDS = 60
+SESSION_RATE_MAX_REQUESTS = 240
+# Forum-specific limiters, stricter than the general one, keyed on session token.
+FORUM_WRITE_WINDOW_SECONDS = 60     # create_thread + post_comment
+FORUM_WRITE_MAX = 10
+SEARCH_RATE_WINDOW_SECONDS = 60     # search decrypts every candidate row — expensive
+SEARCH_RATE_MAX = 10
+
+# Forum posting reputation gate: a user is blocked from creating threads or
+# comments once their reputation reaches this value or lower.
+NEGATIVE_REP_POST_THRESHOLD = -10
+# Brigade detection: if a user accumulates more than this many distinct
+# currently-negative ratings within the window, emit an audit warning.
+NEGATIVE_RATING_BURST_WINDOW_SECONDS = 86400
+NEGATIVE_RATING_BURST_LIMIT = 5
 
 BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME")
 BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
@@ -154,6 +175,8 @@ def audit_log(
     target_user: Optional[str] = None,
     job_id: Optional[int] = None,
     chat_id: Optional[int] = None,
+    thread_id: Optional[int] = None,
+    post_id: Optional[int] = None,
     status: str = "INFO",
     details: Optional[str] = None,
 ) -> None:
@@ -170,6 +193,10 @@ def audit_log(
         parts.append(f"job_id={job_id}")
     if chat_id is not None:
         parts.append(f"chat_id={chat_id}")
+    if thread_id is not None:
+        parts.append(f"thread_id={thread_id}")
+    if post_id is not None:
+        parts.append(f"post_id={post_id}")
     if details:
         parts.append(f"details={sanitize_log_value(details)}")
     log(" ".join(parts))
@@ -245,6 +272,8 @@ def validate_nickname(nickname: str) -> Optional[str]:
 def validate_password(password: str) -> Optional[str]:
     if len(password) < MIN_PASSWORD_LEN:
         return f"Password must be at least {MIN_PASSWORD_LEN} characters."
+    if len(password) > MAX_PASSWORD_LEN:
+        return f"Password must be at most {MAX_PASSWORD_LEN} characters."
     return None
 
 
@@ -291,6 +320,8 @@ def validate_thread_title(title: str) -> Optional[str]:
 def validate_thread_body(body: str) -> Optional[str]:
     if not body or len(body) > MAX_THREAD_BODY_LEN:
         return f"Thread body must be 1-{MAX_THREAD_BODY_LEN} characters."
+    if len(body.encode("utf-8")) > MAX_THREAD_BODY_BYTES:
+        return f"Thread body must be at most {MAX_THREAD_BODY_BYTES} bytes."
     if has_forbidden_chars(body):
         return "Thread body contains forbidden characters."
     if not THREAD_BODY_RE.fullmatch(body):
@@ -532,6 +563,8 @@ class Database:
                 )
             if len(BOOTSTRAP_ADMIN_PASSWORD) < 12:
                 raise RuntimeError("Bootstrap admin password must be at least 12 characters.")
+            if len(BOOTSTRAP_ADMIN_PASSWORD) > MAX_PASSWORD_LEN:
+                raise RuntimeError(f"Bootstrap admin password must be at most {MAX_PASSWORD_LEN} characters.")
             nick_err = validate_nickname(BOOTSTRAP_ADMIN_USERNAME)
             if nick_err:
                 raise RuntimeError(f"Invalid admin username: {nick_err}")
@@ -907,6 +940,48 @@ class Database:
             con.execute("UPDATE jobs SET selected_worker_id = NULL, updated_at = ? WHERE selected_worker_id = ? AND status = 'open'", (int(time.time()), target["id"]))
             return True, "User banned permanently.", int(target["id"])
 
+    def wipe_user(self, actor_id: int, nickname: str) -> tuple[bool, str, Optional[int]]:
+        """Admin action: ban the user (keeping the account row) and delete all
+        of their authored jobs, authored threads (cascading their comments), and
+        their comments on other threads. Chats/messages and the account itself
+        are preserved."""
+        now = int(time.time())
+        with self.lock, self.conn() as con:
+            actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
+            if actor is None or not bool(actor["is_admin"]):
+                return False, "Not allowed.", None
+            target = con.execute("SELECT id, nickname, is_admin FROM users WHERE nickname = ?", (nickname,)).fetchone()
+            if target is None:
+                return False, "User not found.", None
+            if bool(target["is_admin"]):
+                return False, "Admin accounts cannot be wiped.", None
+            tid = int(target["id"])
+            # Ban (keep the account row).
+            con.execute("UPDATE users SET is_banned = 1 WHERE id = ?", (tid,))
+            # Mirror ban_user's cascade: drop the user's accepts and clear any
+            # open-job selections pointing at them.
+            con.execute("DELETE FROM job_accepts WHERE user_id = ?", (tid,))
+            con.execute("UPDATE jobs SET selected_worker_id = NULL, updated_at = ? WHERE selected_worker_id = ? AND status = 'open'", (now, tid))
+            # Delete authored jobs (job_accepts for those jobs cascade away).
+            jobs_deleted = con.execute("DELETE FROM jobs WHERE author_id = ?", (tid,)).rowcount
+            # Delete authored threads (their thread_posts cascade away) and any
+            # comments the user left on other people's threads.
+            threads_deleted = con.execute("DELETE FROM threads WHERE author_id = ?", (tid,)).rowcount
+            comments_deleted = con.execute("DELETE FROM thread_posts WHERE author_id = ?", (tid,)).rowcount
+            detail = f"jobs={jobs_deleted} threads={threads_deleted} comments={comments_deleted}"
+            return True, f"User wiped and banned. Removed {detail}.", tid
+
+    def count_recent_negative_ratings(self, target_id: int, since_ts: int) -> int:
+        """Distinct raters whose current rating of target is negative and was
+        set or last changed within the window. Used for brigade detection."""
+        with self.lock, self.conn() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM reputation_ratings "
+                "WHERE target_id = ? AND rating_value < 0 AND last_changed_at >= ?",
+                (target_id, since_ts),
+            ).fetchone()
+            return int(row["c"]) if row is not None else 0
+
     def delete_job(self, actor_id: int, job_id: int) -> tuple[bool, str]:
         with self.lock, self.conn() as con:
             actor = con.execute("SELECT id, is_admin FROM users WHERE id = ?", (actor_id,)).fetchone()
@@ -1219,8 +1294,8 @@ class Database:
         row = con.execute("SELECT reputation, is_banned FROM users WHERE id = ?", (user_id,)).fetchone()
         if row is None or bool(row["is_banned"]):
             return False, "Not allowed."
-        if int(row["reputation"]) < 0:
-            return False, "Negative reputation users cannot post or comment on threads."
+        if int(row["reputation"]) <= NEGATIVE_REP_POST_THRESHOLD:
+            return False, f"Users with reputation of {NEGATIVE_REP_POST_THRESHOLD} or below cannot post or comment on threads."
         return True, "OK"
 
     def _thread_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -1553,6 +1628,11 @@ parse_error_limiter = SlidingWindowLimiter(GLOBAL_WINDOW_SECONDS, MAX_PARSE_ERRO
 # has their own independent bucket. Prevents chat flooding even though all
 # Tor clients share the same IP (127.0.0.1) and thus the same global bucket.
 message_rate_limiter = SlidingWindowLimiter(MESSAGE_RATE_WINDOW_SECONDS, MESSAGE_RATE_MAX_MESSAGES)
+# General per-session limiter applied to every authenticated action, plus the
+# stricter forum-write and search limiters. All keyed on session token.
+session_rate_limiter = SlidingWindowLimiter(SESSION_RATE_WINDOW_SECONDS, SESSION_RATE_MAX_REQUESTS)
+forum_write_limiter = SlidingWindowLimiter(FORUM_WRITE_WINDOW_SECONDS, FORUM_WRITE_MAX)
+search_rate_limiter = SlidingWindowLimiter(SEARCH_RATE_WINDOW_SECONDS, SEARCH_RATE_MAX)
 
 
 # =========================
@@ -1608,6 +1688,7 @@ VALID_ACTIONS = {
     "post_comment",
     "delete_thread",
     "delete_comment",
+    "wipe_user",
 }
 
 
@@ -1615,6 +1696,13 @@ def require_session(request: dict[str, Any]) -> tuple[Optional[Session], Optiona
     session = sessions.get(request.get("session_token"))
     if not session:
         return None, err("Authentication required.", "auth_required")
+    # General per-session throttle. Because every Tor client shares 127.0.0.1,
+    # this token-keyed bucket is what actually rate-limits an individual user
+    # across all authenticated actions; the global IP bucket is shared.
+    allowed, retry = session_rate_limiter.allow(session.token)
+    if not allowed:
+        audit_log(event="session_rate_limited", actor_nickname=session.nickname, status="blocked", details=f"retry_after={retry}s")
+        return None, err("Too many requests. Slow down.", "rate_limited", retry)
     user = get_db().get_user(session.user_id)
     if user is None:
         sessions.delete(session.token)
@@ -1662,6 +1750,13 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         if not allowed_login:
             audit_log(event="login_throttled", action=action, ip=ip, actor_nickname=nickname or None, status="blocked", details=f"retry_after={retry}s")
             return err("Login temporarily blocked for this nickname from your address.", "login_throttled", retry)
+        # An over-length password can never match a stored (<= MAX_PASSWORD_LEN)
+        # one. Reject before hashing to avoid a needless PBKDF2 round and to
+        # close a cheap CPU-exhaustion lever.
+        if len(password) > MAX_PASSWORD_LEN:
+            login_throttle.fail(ip, nickname)
+            audit_log(event="login_failed", action=action, ip=ip, actor_nickname=nickname or None, status="fail", details="invalid credentials")
+            return err("Invalid credentials.", "login_failed")
         user = get_db().authenticate(nickname, password)
         if not user:
             login_throttle.fail(ip, nickname)
@@ -1690,12 +1785,13 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         return ok({"nickname": str(user["nickname"]), "reputation": int(user["reputation"]), "created_at": int(user["created_at"]), "is_admin": bool(user["is_admin"]), "is_banned": bool(user["is_banned"])})
 
     if action == "list_jobs":
+        session, failure = require_session(request)
+        if failure:
+            return failure
         status = request.get("status")
         if status is not None and status not in {"open", "done", "cancelled"}:
             return err("Invalid status filter.", "validation_error")
-        session = sessions.get(request.get("session_token"))
-        viewer_id = session.user_id if session else None
-        return ok({"jobs": get_db().list_jobs(viewer_id=viewer_id, status=status)})
+        return ok({"jobs": get_db().list_jobs(viewer_id=session.user_id, status=status)})
 
     if action == "my_jobs":
         session, failure = require_session(request)
@@ -1725,14 +1821,15 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         return ok(result, "Job created.")
 
     if action == "job_details":
+        session, failure = require_session(request)
+        if failure:
+            return failure
         try:
             job_id_int = int(request.get("job_id"))
         except Exception:
             return err("Invalid job id.", "validation_error")
         unlock_token = request.get("unlock_token")
-        session = sessions.get(request.get("session_token"))
-        viewer_id = session.user_id if session else None
-        success, message, data = get_db().get_job_for_viewer(job_id_int, viewer_id, str(unlock_token) if unlock_token else None)
+        success, message, data = get_db().get_job_for_viewer(job_id_int, session.user_id, str(unlock_token) if unlock_token else None)
         return ok(data, message) if success and data is not None else err(message, "not_found")
 
     if action == "accept_job":
@@ -1826,8 +1923,13 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         problem = validate_nickname(nickname) or validate_rating_choice(rating)
         if problem:
             return err(problem, "validation_error")
-        success, message, _ = get_db().set_user_rating(session.user_id, nickname, rating)
+        success, message, target_id = get_db().set_user_rating(session.user_id, nickname, rating)
         audit_log(event="user_rate", action=action, ip=ip, actor_nickname=session.nickname, target_user=nickname, status="success" if success else "fail", details=message)
+        if success and rating == "negative" and target_id is not None:
+            since = int(time.time()) - NEGATIVE_RATING_BURST_WINDOW_SECONDS
+            recent_negs = get_db().count_recent_negative_ratings(target_id, since)
+            if recent_negs > NEGATIVE_RATING_BURST_LIMIT:
+                audit_log(event="reputation_negative_burst", ip=ip, target_user=nickname, status="warn", details=f"{recent_negs} negative ratings in last 24h")
         return ok(message=message) if success else err(message, "rating_failed")
 
     if action == "block_user":
@@ -1930,44 +2032,59 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         session, failure = require_session(request)
         if failure:
             return failure
+        allowed_w, retry_w = forum_write_limiter.allow(session.token)
+        if not allowed_w:
+            audit_log(event="forum_write_rate_limited", action=action, ip=ip, actor_nickname=session.nickname, status="blocked", details=f"retry_after={retry_w}s")
+            return err("Posting too fast. Slow down.", "rate_limited", retry_w)
         title = str(request.get("title", "")).strip()
         body = str(request.get("body", "")).replace("\r\n", "\n").replace("\r", "\n").strip()
         problem = validate_thread_title(title) or validate_thread_body(body)
         if problem:
             return err(problem, "validation_error")
         success, message, thread_id = get_db().create_thread(session.user_id, title, body)
-        audit_log(event="thread_create", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        audit_log(event="thread_create", action=action, ip=ip, actor_nickname=session.nickname, thread_id=thread_id, status="success" if success else "fail", details=message)
         return ok({"thread_id": thread_id}, message) if success else err(message, "thread_failed")
 
     if action == "list_threads":
-        session = sessions.get(request.get("session_token"))
-        viewer_id = session.user_id if session else None
-        return ok({"threads": get_db().list_threads(viewer_id=viewer_id)})
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        return ok({"threads": get_db().list_threads(viewer_id=session.user_id)})
 
     if action == "search_threads":
-        session = sessions.get(request.get("session_token"))
-        viewer_id = session.user_id if session else None
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        allowed_s, retry_s = search_rate_limiter.allow(session.token)
+        if not allowed_s:
+            audit_log(event="search_rate_limited", action=action, ip=ip, actor_nickname=session.nickname, status="blocked", details=f"retry_after={retry_s}s")
+            return err("Searching too fast. Slow down.", "rate_limited", retry_s)
         query_text = str(request.get("query", "")).strip()
         problem = validate_search_query(query_text)
         if problem:
             return err(problem, "validation_error")
-        results = get_db().search_threads(viewer_id=viewer_id, query_text=query_text)
+        results = get_db().search_threads(viewer_id=session.user_id, query_text=query_text)
         return ok({"threads": results, "query": query_text})
 
     if action == "thread_details":
+        session, failure = require_session(request)
+        if failure:
+            return failure
         try:
             thread_id_int = int(request.get("thread_id"))
         except Exception:
             return err("Invalid thread id.", "validation_error")
-        session = sessions.get(request.get("session_token"))
-        viewer_id = session.user_id if session else None
-        success, message, data = get_db().get_thread_for_viewer(thread_id_int, viewer_id)
+        success, message, data = get_db().get_thread_for_viewer(thread_id_int, session.user_id)
         return ok(data, message) if success and data is not None else err(message, "not_found")
 
     if action == "post_comment":
         session, failure = require_session(request)
         if failure:
             return failure
+        allowed_w, retry_w = forum_write_limiter.allow(session.token)
+        if not allowed_w:
+            audit_log(event="forum_write_rate_limited", action=action, ip=ip, actor_nickname=session.nickname, status="blocked", details=f"retry_after={retry_w}s")
+            return err("Posting too fast. Slow down.", "rate_limited", retry_w)
         try:
             thread_id = int(request.get("thread_id"))
         except Exception:
@@ -1977,7 +2094,7 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         if problem:
             return err(problem, "validation_error")
         success, message, post_id = get_db().add_thread_post(thread_id, session.user_id, body)
-        audit_log(event="thread_comment", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        audit_log(event="thread_comment", action=action, ip=ip, actor_nickname=session.nickname, thread_id=thread_id, post_id=post_id, status="success" if success else "fail", details=message)
         return ok({"comment_id": post_id}, message) if success else err(message, "comment_failed")
 
     if action == "delete_thread":
@@ -1989,7 +2106,7 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         except Exception:
             return err("Invalid thread id.", "validation_error")
         success, message = get_db().delete_thread(session.user_id, thread_id)
-        audit_log(event="thread_delete", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        audit_log(event="thread_delete", action=action, ip=ip, actor_nickname=session.nickname, thread_id=thread_id, status="success" if success else "fail", details=message)
         return ok(message=message) if success else err(message, "delete_failed")
 
     if action == "delete_comment":
@@ -2001,8 +2118,24 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         except Exception:
             return err("Invalid comment id.", "validation_error")
         success, message = get_db().delete_thread_post(session.user_id, comment_id)
-        audit_log(event="comment_delete", action=action, ip=ip, actor_nickname=session.nickname, status="success" if success else "fail", details=message)
+        audit_log(event="comment_delete", action=action, ip=ip, actor_nickname=session.nickname, post_id=comment_id, status="success" if success else "fail", details=message)
         return ok(message=message) if success else err(message, "delete_failed")
+
+    if action == "wipe_user":
+        session, failure = require_session(request)
+        if failure:
+            return failure
+        nickname = str(request.get("nickname", "")).strip()
+        problem = validate_nickname(nickname)
+        if problem:
+            return err(problem, "validation_error")
+        success, message, wiped_id = get_db().wipe_user(session.user_id, nickname)
+        if success and wiped_id is not None:
+            sessions.delete_user_sessions(wiped_id)
+            audit_log(event="user_wipe", action=action, ip=ip, actor_nickname=session.nickname, target_user=nickname, status="success", details=message)
+            return ok(message=message)
+        audit_log(event="user_wipe", action=action, ip=ip, actor_nickname=session.nickname, target_user=nickname, status="fail", details=message)
+        return err(message, "wipe_failed")
 
     return err("Unknown action.", "unknown_action")
 
