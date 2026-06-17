@@ -628,27 +628,21 @@ def chats_menu(client: RemoteClient) -> None:
             return
         chats = response["data"].get("chats", [])
         print_chats(chats)
-        existing_ids = {int(ch["chat_id"]) for ch in chats}
-        print(c("commands: view, send, back", CYAN))
-        print(c("(view takes a chat id from the list, or a nickname to open/start a chat)", DIM))
-        choice = choose("chat@node> ", {"view": "view", "send": "send", "back": "back"})
-        if choice == "view":
-            target = ask("chat id or nickname> ")
-            chat_id: Optional[int] = None
-            if target.isdigit() and int(target) in existing_ids:
-                # Existing conversation, selected by its id from the list.
-                chat_id = int(target)
-            else:
-                # Treat as a nickname: ensure a chat exists, then view it. This
-                # folds the old "open" command into "view".
-                resp = client.request({"action": "open_chat", "nickname": target})
-                if not resp.get("ok"):
-                    show_result(resp)
-                    pause()
-                    continue
-                chat_id = (resp.get("data") or {}).get("chat_id")
-            # Viewing the conversation lists every message and marks them read,
-            # which makes the old single-message "read" command unnecessary.
+        print(c("commands: open, view, send, back", CYAN))
+        print(c("(open starts/ensures a chat with a nickname; view opens a chat by its id)", DIM))
+        choice = choose("chat@node> ", {"open": "open", "view": "view", "send": "send", "back": "back"})
+        if choice == "open":
+            nickname = ask("chat <nickname> > ")
+            resp = client.request({"action": "open_chat", "nickname": nickname})
+            show_result(resp)
+            if resp.get("ok") and resp.get("data"):
+                key_value("Chat id", str(resp["data"].get("chat_id")), GREEN)
+                print(c("use 'view' with this chat id to read it, or 'send' to message.", DIM))
+            pause()
+        elif choice == "view":
+            chat_id = ask_int("chat id> ")
+            # Viewing lists every message and marks them read, which makes a
+            # separate single-message "read" command unnecessary.
             resp = client.request({"action": "list_messages", "chat_id": chat_id})
             if resp.get("ok"):
                 clear()
