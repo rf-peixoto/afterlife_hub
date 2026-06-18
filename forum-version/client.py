@@ -452,16 +452,60 @@ def view_profile(client: RemoteClient) -> None:
     pause()
 
 
-def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed_mode: bool = False) -> None:
-    clear()
-    section(f"JOB BOARD // {(status or 'all').upper()} CONTRACTS")
-    response = client.request({"action": "list_jobs", "status": status})
-    if not response.get("ok"):
-        show_result(response)
-        pause()
+def page_status(pg: Optional[dict[str, Any]]) -> None:
+    """Print a 'page X/Y (N total)' status line for a paginated response."""
+    if not pg:
         return
-    print_jobs(response["data"]["jobs"], completed_mode=completed_mode)
-    pause()
+    print(line("·"))
+    print(c(f"page {pg.get('page', 1)}/{pg.get('total_pages', 1)}  "
+            f"({pg.get('total', 0)} total)", DIM))
+
+
+def nav_choices(pg: Optional[dict[str, Any]], extra: Optional[list[str]] = None) -> dict[str, str]:
+    """Build a choose() map of navigation + extra commands based on pagination."""
+    opts: dict[str, str] = {}
+    if pg and pg.get("has_prev"):
+        opts["prev"] = "prev"
+    if pg and pg.get("has_next"):
+        opts["next"] = "next"
+    for e in (extra or []):
+        opts[e] = e
+    opts["back"] = "back"
+    return opts
+
+
+def apply_nav(choice: str, page: int, pg: Optional[dict[str, Any]]) -> Optional[int]:
+    """Translate a nav command into a new page number, or None if not a nav command."""
+    if choice == "next" and pg and pg.get("has_next"):
+        return page + 1
+    if choice == "prev" and pg and pg.get("has_prev"):
+        return max(1, page - 1)
+    return None
+
+
+def list_jobs_menu(client: RemoteClient, status: Optional[str] = None, completed_mode: bool = False) -> None:
+    page = 1
+    while True:
+        clear()
+        section(f"JOB BOARD // {(status or 'all').upper()} CONTRACTS")
+        response = client.request({"action": "list_jobs", "status": status, "page": page})
+        if not response.get("ok"):
+            show_result(response)
+            pause()
+            return
+        data = response["data"]
+        print_jobs(data.get("jobs", []), completed_mode=completed_mode)
+        pg = data.get("pagination")
+        page = pg.get("page", page) if pg else page
+        page_status(pg)
+        cmds = nav_choices(pg)
+        print(c("commands: " + ", ".join(cmds), CYAN))
+        choice = choose("jobs@node> ", cmds)
+        new_page = apply_nav(choice, page, pg)
+        if new_page is not None:
+            page = new_page
+        else:
+            return
 
 
 def create_job_menu(client: RemoteClient) -> None:
@@ -733,18 +777,59 @@ def view_thread(client: RemoteClient, thread_id: int) -> None:
             return
 
 
+def forum_search_menu(client: RemoteClient) -> None:
+    clear()
+    section("FORUM // SEARCH THREADS")
+    print(c("search query (at least 3 characters)", DIM))
+    query = ask("search query> ")
+    page = 1
+    while True:
+        resp = client.request({"action": "search_threads", "query": query, "page": page})
+        if not resp.get("ok"):
+            show_result(resp)
+            pause()
+            return
+        data = resp["data"]
+        clear()
+        section("FORUM // SEARCH RESULTS")
+        print_threads(data.get("threads", []), heading=f"results for: {query}")
+        pg = data.get("pagination")
+        page = pg.get("page", page) if pg else page
+        page_status(pg)
+        cmds = nav_choices(pg, extra=["view"])
+        print(c("commands: " + ", ".join(cmds), CYAN))
+        choice = choose("search@node> ", cmds)
+        new_page = apply_nav(choice, page, pg)
+        if new_page is not None:
+            page = new_page
+        elif choice == "view":
+            view_thread(client, ask_int("thread id> "))
+        else:
+            return
+
+
 def forum_menu(client: RemoteClient) -> None:
+    page = 1
     while True:
         clear()
         section("FORUM // COMMUNITY BOARD", "text-only threads — no emoji, no images")
-        response = client.request({"action": "list_threads"})
+        response = client.request({"action": "list_threads", "page": page})
         if not response.get("ok"):
             show_result(response)
             pause()
             return
-        print_threads(response["data"].get("threads", []))
-        print(c("commands: view, create, search, back", CYAN))
-        choice = choose("forum@node> ", {"view": "view", "create": "create", "search": "search", "back": "back"})
+        data = response["data"]
+        print_threads(data.get("threads", []))
+        pg = data.get("pagination")
+        page = pg.get("page", page) if pg else page
+        page_status(pg)
+        cmds = nav_choices(pg, extra=["view", "create", "search"])
+        print(c("commands: " + ", ".join(cmds), CYAN))
+        choice = choose("forum@node> ", cmds)
+        new_page = apply_nav(choice, page, pg)
+        if new_page is not None:
+            page = new_page
+            continue
         if choice == "view":
             thread_id = ask_int("thread id> ")
             view_thread(client, thread_id)
@@ -768,17 +853,7 @@ def forum_menu(client: RemoteClient) -> None:
                 key_value("Thread", str(resp["data"].get("thread_id")), GREEN)
             pause()
         elif choice == "search":
-            clear()
-            section("FORUM // SEARCH THREADS")
-            query = ask("search query> ")
-            resp = client.request({"action": "search_threads", "query": query})
-            if resp.get("ok"):
-                clear()
-                section("FORUM // SEARCH RESULTS")
-                print_threads(resp["data"].get("threads", []), heading=f"results for: {query}")
-            else:
-                show_result(resp)
-            pause()
+            forum_search_menu(client)
         else:
             return
 

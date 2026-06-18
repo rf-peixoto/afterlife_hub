@@ -40,7 +40,9 @@ MAX_THREAD_BODY_LEN = 2096
 MAX_THREAD_BODY_BYTES = 4096
 MAX_COMMENT_LEN = 1000
 MAX_SEARCH_QUERY_LEN = 64
+MIN_SEARCH_QUERY_LEN = 3      # minimum chars before the heavy decrypt search runs
 MAX_SEARCH_RESULTS = 50
+PAGE_SIZE = 10               # default items per page for paginated listings
 MIN_NICK_LEN = 3
 MAX_NICK_LEN = 12
 MIN_PASSWORD_LEN = 8
@@ -340,13 +342,37 @@ def validate_comment_text(body: str) -> Optional[str]:
 
 
 def validate_search_query(query: str) -> Optional[str]:
-    if not query or len(query) > MAX_SEARCH_QUERY_LEN:
-        return f"Search query must be 1-{MAX_SEARCH_QUERY_LEN} characters."
+    if not query or len(query) < MIN_SEARCH_QUERY_LEN:
+        return f"Search query must be at least {MIN_SEARCH_QUERY_LEN} characters."
+    if len(query) > MAX_SEARCH_QUERY_LEN:
+        return f"Search query must be at most {MAX_SEARCH_QUERY_LEN} characters."
     if has_forbidden_chars(query):
         return "Search query contains forbidden characters."
     if not SEARCH_QUERY_RE.fullmatch(query):
         return "Search query contains unsupported characters."
     return None
+
+
+def parse_page(request: dict[str, Any]) -> int:
+    """Read a 1-based page number from a request, defaulting to 1."""
+    try:
+        page = int(request.get("page", 1))
+    except (TypeError, ValueError):
+        return 1
+    return page if page >= 1 else 1
+
+
+def pagination_meta(total: int, page: int, per_page: int = PAGE_SIZE) -> dict[str, Any]:
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(max(1, page), total_pages)
+    return {
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": total_pages,
+        "has_prev": page > 1,
+        "has_next": page < total_pages,
+    }
 
 
 def validate_reward(raw: str) -> Optional[str]:
@@ -669,13 +695,12 @@ class Database:
             )
             return {"job_id": cur.lastrowid, "private_token": private_token}
 
-    def list_jobs(self, viewer_id: Optional[int], status: Optional[str] = None) -> list[dict[str, Any]]:
+    def list_jobs(self, viewer_id: Optional[int], status: Optional[str] = None,
+                  page: int = 1, per_page: int = PAGE_SIZE) -> tuple[list[dict[str, Any]], int, int]:
+        """Return (items, total, effective_page). Only one page of rows is read
+        from the database, so the response size is bounded regardless of how
+        many contracts exist."""
         with self.lock, self.conn() as con:
-            query = (
-                "SELECT j.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned, "
-                "(SELECT COUNT(*) FROM job_accepts a WHERE a.job_id = j.id) AS accept_count "
-                "FROM jobs j JOIN users u ON u.id = j.author_id "
-            )
             params: list[Any] = []
             clauses: list[str] = []
             if status:
@@ -686,12 +711,22 @@ class Database:
                     "NOT EXISTS (SELECT 1 FROM user_blocks b WHERE (b.blocker_id = ? AND b.blocked_id = j.author_id) OR (b.blocker_id = j.author_id AND b.blocked_id = ?))"
                 )
                 params.extend([viewer_id, viewer_id])
+            from_where = "FROM jobs j JOIN users u ON u.id = j.author_id "
             if clauses:
-                query += "WHERE " + " AND ".join(clauses) + " "
-            query += "ORDER BY j.created_at DESC"
-            rows = con.execute(query, params).fetchall()
+                from_where += "WHERE " + " AND ".join(clauses) + " "
+            total = int(con.execute("SELECT COUNT(*) " + from_where, params).fetchone()[0])
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            page = min(max(1, page), total_pages)
+            offset = (page - 1) * per_page
+            select = (
+                "SELECT j.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned, "
+                "(SELECT COUNT(*) FROM job_accepts a WHERE a.job_id = j.id) AS accept_count "
+                + from_where + "ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?"
+            )
+            rows = con.execute(select, params + [per_page, offset]).fetchall()
             viewer = self.get_user(viewer_id) if viewer_id else None
-            return [self._job_row_to_public_dict(row, viewer) for row in rows]
+            items = [self._job_row_to_public_dict(row, viewer) for row in rows]
+            return items, total, page
 
     def my_authored_jobs(self, user_id: int) -> list[dict[str, Any]]:
         with self.lock, self.conn() as con:
@@ -1337,27 +1372,41 @@ class Database:
         )
         return clause, [viewer_id, viewer_id]
 
-    def list_threads(self, viewer_id: Optional[int]) -> list[dict[str, Any]]:
+    def list_threads(self, viewer_id: Optional[int], page: int = 1,
+                     per_page: int = PAGE_SIZE) -> tuple[list[dict[str, Any]], int, int]:
+        """Return (items, total, effective_page) for the forum board, reading
+        only one page of rows from the database."""
         with self.lock, self.conn() as con:
-            query = (
+            clause, params = self._thread_block_clause(viewer_id)
+            from_where = "FROM threads t JOIN users u ON u.id = t.author_id "
+            if clause:
+                from_where += "WHERE " + clause + " "
+            total = int(con.execute("SELECT COUNT(*) " + from_where, params).fetchone()[0])
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            page = min(max(1, page), total_pages)
+            offset = (page - 1) * per_page
+            select = (
                 "SELECT t.*, u.nickname AS author_nickname, u.is_banned AS author_is_banned, "
                 "(SELECT COUNT(*) FROM thread_posts p WHERE p.thread_id = t.id) AS reply_count "
-                "FROM threads t JOIN users u ON u.id = t.author_id "
+                + from_where + "ORDER BY t.updated_at DESC, t.id DESC LIMIT ? OFFSET ?"
             )
-            clause, params = self._thread_block_clause(viewer_id)
-            if clause:
-                query += "WHERE " + clause + " "
-            query += "ORDER BY t.updated_at DESC"
-            rows = con.execute(query, params).fetchall()
-            return [self._thread_row_to_dict(row) for row in rows]
+            rows = con.execute(select, params + [per_page, offset]).fetchall()
+            return [self._thread_row_to_dict(row) for row in rows], total, page
 
-    def search_threads(self, viewer_id: Optional[int], query_text: str) -> list[dict[str, Any]]:
+    def search_threads(self, viewer_id: Optional[int], query_text: str, page: int = 1,
+                       per_page: int = PAGE_SIZE) -> tuple[list[dict[str, Any]], int, int]:
         """Substring search over thread titles and bodies.
 
         Titles and bodies are Fernet-encrypted at rest (non-deterministic
         ciphertext), so SQL LIKE cannot be used. We decrypt candidate rows in
         memory and filter there. Block filtering is applied in SQL exactly as
-        in list_threads; results are capped at MAX_SEARCH_RESULTS.
+        in list_threads. The number of matches collected is capped at
+        MAX_SEARCH_RESULTS; that capped set is then paginated. The minimum
+        query length is enforced by the caller (validate_search_query), which
+        is the primary guard against decrypt-amplification abuse.
+
+        Returns (items, total, effective_page) where total is the number of
+        collected matches (at most MAX_SEARCH_RESULTS).
         """
         needle = query_text.lower()
         with self.lock, self.conn() as con:
@@ -1369,17 +1418,21 @@ class Database:
             clause, params = self._thread_block_clause(viewer_id)
             if clause:
                 base += "WHERE " + clause + " "
-            base += "ORDER BY t.updated_at DESC"
+            base += "ORDER BY t.updated_at DESC, t.id DESC"
             rows = con.execute(base, params).fetchall()
-            results: list[dict[str, Any]] = []
+            matches: list[dict[str, Any]] = []
             for row in rows:
                 title = get_crypto().dec(row["title_enc"])
                 body = get_crypto().dec(row["body_enc"])
                 if needle in title.lower() or needle in body.lower():
-                    results.append(self._thread_row_to_dict(row))
-                    if len(results) >= MAX_SEARCH_RESULTS:
+                    matches.append(self._thread_row_to_dict(row))
+                    if len(matches) >= MAX_SEARCH_RESULTS:
                         break
-            return results
+            total = len(matches)
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            page = min(max(1, page), total_pages)
+            start = (page - 1) * per_page
+            return matches[start:start + per_page], total, page
 
     def get_thread_for_viewer(self, thread_id: int, viewer_id: Optional[int]) -> tuple[bool, str, Optional[dict[str, Any]]]:
         with self.lock, self.conn() as con:
@@ -1791,7 +1844,8 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         status = request.get("status")
         if status is not None and status not in {"open", "done", "cancelled"}:
             return err("Invalid status filter.", "validation_error")
-        return ok({"jobs": get_db().list_jobs(viewer_id=session.user_id, status=status)})
+        items, total, page = get_db().list_jobs(viewer_id=session.user_id, status=status, page=parse_page(request))
+        return ok({"jobs": items, "pagination": pagination_meta(total, page)})
 
     if action == "my_jobs":
         session, failure = require_session(request)
@@ -2049,7 +2103,8 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         session, failure = require_session(request)
         if failure:
             return failure
-        return ok({"threads": get_db().list_threads(viewer_id=session.user_id)})
+        items, total, page = get_db().list_threads(viewer_id=session.user_id, page=parse_page(request))
+        return ok({"threads": items, "pagination": pagination_meta(total, page)})
 
     if action == "search_threads":
         session, failure = require_session(request)
@@ -2063,8 +2118,8 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         problem = validate_search_query(query_text)
         if problem:
             return err(problem, "validation_error")
-        results = get_db().search_threads(viewer_id=session.user_id, query_text=query_text)
-        return ok({"threads": results, "query": query_text})
+        items, total, page = get_db().search_threads(viewer_id=session.user_id, query_text=query_text, page=parse_page(request))
+        return ok({"threads": items, "query": query_text, "pagination": pagination_meta(total, page)})
 
     if action == "thread_details":
         session, failure = require_session(request)

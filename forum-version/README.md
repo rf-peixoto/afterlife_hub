@@ -267,7 +267,8 @@ categories, no sub-forums.
 - **Comments** — members reply to threads with text comments. Threads are
   ordered by most recent activity.
 - **Search** — keyword search matches thread titles and bodies (case
-  insensitive substring match).
+  insensitive substring match). Queries must be at least 3 characters, and
+  results are paginated; this bounds the work done by the decrypt-based search.
 - **Text only** — titles, bodies, and comments are restricted to the same
   ASCII text policy as the rest of the platform. Emoji, images, and the
   forbidden characters `' " \ / % +` are rejected.
@@ -312,7 +313,11 @@ session — there is no anonymous browsing anywhere on the platform.
   user (more than five within 24 hours) raises an audit warning.
 - Admins can `wipe_user`: this bans the account and deletes all of its jobs,
   threads, and comments while preserving the account row and existing chats.
-- Sessions are single-instance per user — logging in from a new location
+- The job board, the forum thread board, and forum search are paginated (10
+  items per page, newest first). The server reads and returns only one page at
+  a time, so a single request can never force it to serialize or decrypt the
+  entire table \u2014 closing a denial-of-service amplification vector.
+- Sessions are single-instance per user \u2014 logging in from a new location
   invalidates the previous session.
 
 ---
