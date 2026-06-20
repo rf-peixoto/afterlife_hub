@@ -316,8 +316,14 @@ session — there is no anonymous browsing anywhere on the platform.
 - The job board, the forum thread board, and forum search are paginated (10
   items per page, newest first). The server reads and returns only one page at
   a time, so a single request can never force it to serialize or decrypt the
-  entire table \u2014 closing a denial-of-service amplification vector.
-- Sessions are single-instance per user \u2014 logging in from a new location
+  entire table — closing a denial-of-service amplification vector.
+- Registering, logging in, and changing another user's reputation each require
+  the client to solve a fresh proof-of-work challenge (a SHA-256 leading-zero
+  puzzle issued by the server). Verifying costs the server a single hash;
+  solving costs the client roughly 2^difficulty hashes, and the challenge is
+  one-time, so automation pays a CPU price on every attempt. Difficulty is
+  tunable via AFTERLIFE_POW_DIFFICULTY (default 20).
+- Sessions are single-instance per user — logging in from a new location
   invalidates the previous session.
 
 ---

@@ -6,6 +6,9 @@
 # address stays reachable throughout.
 set -e
 
+log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+fatal() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2; exit 1; }
+
 ONION_FILE="/var/lib/tor/afterlife_hs/hostname"
 TOR_WAIT_SECONDS=90
 SERVER_PORT="${AFTERLIFE_PORT:-2077}"
@@ -17,9 +20,6 @@ if ! [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] || (( SERVER_PORT < 1 || SERVER_PORT > 655
 fi
 SERVER_MAX_RESTARTS=20      # give up after this many consecutive crashes
 SERVER_RESTART_DELAY=3      # seconds to wait before restarting
-
-log()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-fatal() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2; exit 1; }
 
 log "Entrypoint started. PID=$$"
 
@@ -46,6 +46,22 @@ su -s /bin/sh debian-tor -c "tor -f /etc/tor/torrc" &
 TOR_PID=$!
 log "Tor started with PID ${TOR_PID}."
 
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+# Installed immediately after Tor starts, BEFORE the hostname wait, so a signal
+# (e.g. SIGTERM from `docker stop` or a compose recreate) received during the
+# wait shuts Tor down cleanly and logs it, instead of killing the entrypoint
+# silently and leaving an orphaned tor process. SERVER_PID is empty until the
+# supervisor loop starts; cleanup handles that.
+SERVER_PID=""
+cleanup() {
+    log "Shutting down..."
+    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
+    kill "$TOR_PID" 2>/dev/null || true
+    [[ -n "$SERVER_PID" ]] && wait "$SERVER_PID" 2>/dev/null || true
+    wait "$TOR_PID" 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT
+
 # ── Wait for .onion hostname ───────────────────────────────────────────────────
 log "Waiting for hidden service hostname (up to ${TOR_WAIT_SECONDS}s)..."
 elapsed=0
@@ -67,18 +83,6 @@ log "========================================="
 log "Onion address : ${ONION_ADDR}"
 log "Client command: proxychains python3 client.py --host ${ONION_ADDR} --port ${SERVER_PORT}"
 log "========================================="
-
-# ── Cleanup trap ──────────────────────────────────────────────────────────────
-# Registered here so it covers both tor and the server restart loop.
-SERVER_PID=""
-cleanup() {
-    log "Shutting down..."
-    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
-    kill "$TOR_PID" 2>/dev/null || true
-    [[ -n "$SERVER_PID" ]] && wait "$SERVER_PID" 2>/dev/null || true
-    wait "$TOR_PID" 2>/dev/null || true
-}
-trap cleanup EXIT TERM INT
 
 # ── Server supervisor loop ────────────────────────────────────────────────────
 # The server is restarted here on crash WITHOUT restarting Tor.

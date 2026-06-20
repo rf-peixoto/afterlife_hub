@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import socket
@@ -149,6 +150,47 @@ class RemoteClient:
 
     def ping(self) -> bool:
         return bool(self.request({"action": "ping"}).get("ok"))
+
+
+def _leading_zero_bits(digest: bytes) -> int:
+    bits = 0
+    for byte in digest:
+        if byte == 0:
+            bits += 8
+            continue
+        bits += 8 - byte.bit_length()
+        break
+    return bits
+
+
+def solve_pow(prefix: str, difficulty: int) -> str:
+    """Brute-force a nonce such that sha256('prefix:nonce') has >= difficulty
+    leading zero bits. This is the deliberately expensive client side."""
+    nonce = 0
+    while True:
+        candidate = str(nonce)
+        digest = hashlib.sha256(f"{prefix}:{candidate}".encode("utf-8")).digest()
+        if _leading_zero_bits(digest) >= difficulty:
+            return candidate
+        nonce += 1
+
+
+def obtain_pow(client: RemoteClient, purpose: str) -> Optional[dict[str, Any]]:
+    """Fetch and solve a proof-of-work challenge for `purpose`. Returns the
+    fields to attach to the protected request, or None on failure."""
+    resp = client.request({"action": "get_challenge", "purpose": purpose})
+    if not resp.get("ok"):
+        show_result(resp)
+        return None
+    data = resp.get("data", {})
+    prefix = str(data.get("prefix", ""))
+    difficulty = int(data.get("difficulty", 20))
+    challenge_id = data.get("challenge_id")
+    print(c(f"solving anti-bot challenge (difficulty {difficulty} bits)... this can take a few seconds", DIM))
+    start = time.time()
+    nonce = solve_pow(prefix, difficulty)
+    print(c(f"challenge solved in {time.time() - start:.1f}s", GREEN))
+    return {"challenge_id": challenge_id, "nonce": nonce}
 
 
 # =========================
@@ -412,7 +454,11 @@ def auth_menu(client: RemoteClient) -> None:
         if choice == "login":
             nickname = ask("nickname> ")
             password = ask_hidden("password> ")
-            response = client.request({"action": "login", "nickname": nickname, "password": password})
+            pow_fields = obtain_pow(client, "login")
+            if pow_fields is None:
+                pause()
+                continue
+            response = client.request({"action": "login", "nickname": nickname, "password": password, **pow_fields})
             show_result(response)
             if response.get("ok"):
                 data = response.get("data", {})
@@ -425,7 +471,11 @@ def auth_menu(client: RemoteClient) -> None:
         elif choice == "register":
             nickname = ask("new nickname> ")
             password = ask_hidden("new password> ")
-            response = client.request({"action": "register", "nickname": nickname, "password": password})
+            pow_fields = obtain_pow(client, "register")
+            if pow_fields is None:
+                pause()
+                continue
+            response = client.request({"action": "register", "nickname": nickname, "password": password, **pow_fields})
             show_result(response)
             pause()
         else:
@@ -633,7 +683,11 @@ def rate_user_menu(client: RemoteClient) -> None:
     section("REPUTATION // RATE USER")
     nickname = ask("nickname> ")
     rating = choose("rating [positive/negative]> ", {"positive": "positive", "negative": "negative"})
-    show_result(client.request({"action": "rate_user", "nickname": nickname, "rating": rating}))
+    pow_fields = obtain_pow(client, "rate_user")
+    if pow_fields is None:
+        pause()
+        return
+    show_result(client.request({"action": "rate_user", "nickname": nickname, "rating": rating, **pow_fields}))
     pause()
 
 

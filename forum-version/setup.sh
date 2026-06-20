@@ -6,7 +6,9 @@ TOR_HS_DIR="./tor-hs"
 TOR_DATA_DIR="./tor-data"
 ENV_FILE="./.env"
 DEFAULT_CONTAINER_NAME="afterlife-server"
+DEFAULT_POW_DIFFICULTY=20
 STARTUP_WAIT_SECONDS=120
+LISTEN_WAIT_SECONDS=60
 HEALTHCHECK_LOG_TAIL=80
 
 GREEN="\033[1;32m"
@@ -18,6 +20,7 @@ RESET="\033[0m"
 ADMIN_USER=""
 ADMIN_PASS=""
 CONTAINER_NAME="${DEFAULT_CONTAINER_NAME}"
+POW_DIFFICULTY="${DEFAULT_POW_DIFFICULTY}"
 
 banner() {
     echo -e "${CYAN}========================================${RESET}"
@@ -65,6 +68,47 @@ validate_password() {
     [[ "$pass" != *$'\r'* ]]  || fail "Admin password cannot contain carriage return characters."
 }
 
+validate_pow_difficulty() {
+    local d="$1"
+    [[ "$d" =~ ^[0-9]+$ ]] || fail "Proof-of-work difficulty must be a whole number."
+    (( d >= 1 ))           || fail "Proof-of-work difficulty must be at least 1."
+}
+
+prompt_pow_difficulty() {
+    echo
+    echo -e "${CYAN}Anti-bot proof-of-work difficulty${RESET}"
+    echo    "Register, login, and changing a user's reputation each force the client to"
+    echo    "solve a SHA-256 puzzle before the action is accepted. The value below is the"
+    echo    "number of leading zero bits required: each extra bit DOUBLES the average work,"
+    echo    "so the cost grows exponentially. Higher means stronger bot/abuse resistance but"
+    echo    "a longer wait for legitimate users on every one of those actions."
+    echo
+    echo    "Times are rough estimates for a pure-Python client at ~1,000,000 hashes/sec;"
+    echo    "a native or multi-threaded solver will be considerably faster."
+    echo
+    echo -e "  ${YELLOW}This is a GUIDE, not a limit - you may enter any whole number >= 1:${RESET}"
+    echo    "    below 16   trivial      almost no cost          (not recommended)"
+    echo    "    16 - 18    weak         ~0.1 - 0.3s per action"
+    echo    "    19 - 21    moderate     ~0.5 - 2s per action    (recommended; default ${DEFAULT_POW_DIFFICULTY})"
+    echo    "    22 - 24    strong       ~4 - 18s per action"
+    echo    "    25 - 27    very strong  ~35s - 2min per action"
+    echo    "    28 +       extreme      minutes per action      (may frustrate real users)"
+    echo
+    echo    "Reference: each +1 is ~2x. e.g. 20 ~= 1s, 24 ~= 18s, 28 ~= 5min on the above client."
+    echo
+    read -rp "Proof-of-work difficulty [${DEFAULT_POW_DIFFICULTY}]: " POW_DIFFICULTY
+    POW_DIFFICULTY="${POW_DIFFICULTY:-$DEFAULT_POW_DIFFICULTY}"
+    validate_pow_difficulty "$POW_DIFFICULTY"
+    if   (( POW_DIFFICULTY < 16 )); then
+        warn "Difficulty ${POW_DIFFICULTY} is very low - bots will barely be slowed down."
+    elif (( POW_DIFFICULTY >= 28 )); then
+        warn "Difficulty ${POW_DIFFICULTY} is extreme - real users may wait minutes per action."
+    elif (( POW_DIFFICULTY >= 25 )); then
+        warn "Difficulty ${POW_DIFFICULTY} is very high - expect noticeably long waits per action."
+    fi
+    success "Proof-of-work difficulty set to ${POW_DIFFICULTY} bits."
+}
+
 prompt_inputs() {
     echo -e "${CYAN}This will bootstrap AFTERLIFE as a Tor hidden service.${RESET}"
     echo -e "${CYAN}The server will NOT be reachable via a raw IP address.${RESET}"
@@ -79,6 +123,8 @@ prompt_inputs() {
 
     read -rp  "Docker container name [${DEFAULT_CONTAINER_NAME}]: " CONTAINER_NAME
     CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
+
+    prompt_pow_difficulty
 }
 
 prepare_folders() {
@@ -101,6 +147,7 @@ write_env() {
         printf 'AFTERLIFE_MASTER_KEY_PATH=%s\n' '/app/data/master.key'
         printf 'AFTERLIFE_LOG_PATH=%s\n'        '/app/data/server.log'
         printf 'AFTERLIFE_PORT=%s\n'            '2077'
+        printf 'AFTERLIFE_POW_DIFFICULTY=%s\n'  "$POW_DIFFICULTY"
     } > "$ENV_FILE"
     chmod 600 "$ENV_FILE" || true
 }
@@ -177,6 +224,23 @@ logs_show_permission_error() {
         | grep -q "Permission denied"
 }
 
+wait_for_listening() {
+    # Poll for the server's listening signal instead of checking once after a
+    # fixed sleep. This is robust against a slow first boot (the initial DB
+    # creation plus the 200k-iteration admin PBKDF2 adds ~a second after the
+    # onion address appears) and against a single early container restart.
+    info "Waiting for the server to reach listening state (up to ${LISTEN_WAIT_SECONDS}s)..."
+    local elapsed=0
+    while (( elapsed < LISTEN_WAIT_SECONDS )); do
+        if logs_show_listening; then
+            return 0
+        fi
+        sleep 1
+        (( elapsed++ ))
+    done
+    return 1
+}
+
 wait_for_onion_address() {
     info "Waiting for Tor hidden service to start (up to ${STARTUP_WAIT_SECONDS}s)..."
     local elapsed=0
@@ -219,6 +283,7 @@ show_summary() {
     echo -e "${GREEN}========================================${RESET}"
     echo "Admin username  : ${ADMIN_USER}"
     echo "Container name  : ${CONTAINER_NAME}"
+    echo "PoW difficulty  : ${POW_DIFFICULTY} bits"
     echo "Log file        : ${DATA_DIR}/server.log"
     echo "Database        : ${DATA_DIR}/AFTERLIFE.db"
     echo
@@ -262,13 +327,12 @@ main() {
 
     sleep 2
 
-    if ! logs_show_listening; then
-        if logs_show_permission_error; then
-            show_diagnostics
-            fail "Container has permission errors. Check logs above."
-        fi
+    if ! wait_for_listening; then
         show_diagnostics
-        fail "Container did not reach listening state. Check logs above."
+        if logs_show_permission_error; then
+            fail "Container has permission errors and never reached listening state. Check logs above."
+        fi
+        fail "Container did not reach listening state within ${LISTEN_WAIT_SECONDS}s. Check logs above."
     fi
 
     success "Container is up and listening."

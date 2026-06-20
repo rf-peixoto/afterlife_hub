@@ -100,6 +100,18 @@ NEGATIVE_REP_POST_THRESHOLD = -10
 NEGATIVE_RATING_BURST_WINDOW_SECONDS = 86400
 NEGATIVE_RATING_BURST_LIMIT = 5
 
+# Proof-of-work (client puzzle) gate for register, login, and rate_user.
+# A get_challenge call issues a one-time, server-random challenge; the client
+# must find a nonce whose SHA-256 digest of "prefix:nonce" has at least
+# POW_DIFFICULTY leading zero bits. Verification is a single hash; solving costs
+# ~2^difficulty hashes. At ~1M hashes/sec (pure-Python client) the approximate
+# average solve time is: 20 bits ~1s, 21 bits ~2s, 22 bits ~4.5s.
+POW_DIFFICULTY = int(os.environ.get("AFTERLIFE_POW_DIFFICULTY", "20"))
+POW_CHALLENGE_TTL_SECONDS = int(os.environ.get("AFTERLIFE_POW_TTL_SECONDS", "180"))
+POW_MAX_CHALLENGES = int(os.environ.get("AFTERLIFE_POW_MAX_CHALLENGES", "20000"))
+POW_PREFIX_BYTES = 16
+POW_PURPOSES = {"register", "login", "rate_user"}
+
 BOOTSTRAP_ADMIN_USERNAME = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME")
 BOOTSTRAP_ADMIN_PASSWORD = os.environ.get("AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD")
 
@@ -1590,6 +1602,90 @@ class SessionStore:
                 self.sessions.pop(token, None)
 
 
+def leading_zero_bits(digest: bytes) -> int:
+    """Number of leading zero bits in a byte string."""
+    bits = 0
+    for byte in digest:
+        if byte == 0:
+            bits += 8
+            continue
+        bits += 8 - byte.bit_length()
+        break
+    return bits
+
+
+def pow_solution_ok(prefix: str, nonce: str, difficulty: int) -> bool:
+    """Verify a proof-of-work solution: sha256("prefix:nonce") must have at
+    least `difficulty` leading zero bits. This is the single-hash verification
+    side; the client pays the ~2^difficulty cost to find a valid nonce."""
+    digest = hashlib.sha256(f"{prefix}:{nonce}".encode("utf-8")).digest()
+    return leading_zero_bits(digest) >= difficulty
+
+
+class ChallengeManager:
+    """Issues and verifies one-time proof-of-work challenges.
+
+    A challenge ties a random prefix to a difficulty and a purpose, with a short
+    TTL. Solving requires brute-forcing a nonce (expensive); verifying is one
+    hash (cheap). Consuming a challenge deletes it, so every protected action
+    requires a freshly solved challenge - there is no reusable token.
+    """
+
+    def __init__(self, difficulty: int, ttl_seconds: int, max_size: int) -> None:
+        self.lock = threading.Lock()
+        self.difficulty = max(1, difficulty)
+        self.ttl = ttl_seconds
+        self.max_size = max_size
+        self.store: dict[str, dict[str, Any]] = {}
+
+    def _cleanup(self, now: float) -> None:
+        expired = [cid for cid, c in self.store.items() if c["expires_at"] <= now]
+        for cid in expired:
+            self.store.pop(cid, None)
+        if len(self.store) > self.max_size:
+            ordered = sorted(self.store.items(), key=lambda kv: kv[1]["expires_at"])
+            for cid, _ in ordered[: len(self.store) - self.max_size]:
+                self.store.pop(cid, None)
+
+    def issue(self, purpose: str) -> dict[str, Any]:
+        now = time.time()
+        with self.lock:
+            self._cleanup(now)
+            challenge_id = secrets.token_hex(16)
+            prefix = secrets.token_hex(POW_PREFIX_BYTES)
+            self.store[challenge_id] = {
+                "prefix": prefix,
+                "difficulty": self.difficulty,
+                "purpose": purpose,
+                "expires_at": now + self.ttl,
+            }
+            return {
+                "challenge_id": challenge_id,
+                "prefix": prefix,
+                "difficulty": self.difficulty,
+                "algorithm": "sha256-leading-zero-bits",
+                "expires_in": self.ttl,
+            }
+
+    def consume(self, challenge_id: str, nonce: str, purpose: str) -> tuple[bool, str]:
+        now = time.time()
+        with self.lock:
+            self._cleanup(now)
+            challenge = self.store.get(challenge_id)
+            if challenge is None:
+                return False, "Challenge not found or expired. Request a new one."
+            if challenge["purpose"] != purpose:
+                return False, "Challenge was issued for a different action."
+            if challenge["expires_at"] <= now:
+                self.store.pop(challenge_id, None)
+                return False, "Challenge expired. Request a new one."
+            if not pow_solution_ok(challenge["prefix"], str(nonce), int(challenge["difficulty"])):
+                return False, "Invalid proof-of-work solution."
+            # One-time use: consume on success so the same solution cannot be replayed.
+            self.store.pop(challenge_id, None)
+            return True, "OK"
+
+
 class SlidingWindowLimiter:
     def __init__(self, window_seconds: int, max_events: int) -> None:
         self.window_seconds = window_seconds
@@ -1686,6 +1782,8 @@ message_rate_limiter = SlidingWindowLimiter(MESSAGE_RATE_WINDOW_SECONDS, MESSAGE
 session_rate_limiter = SlidingWindowLimiter(SESSION_RATE_WINDOW_SECONDS, SESSION_RATE_MAX_REQUESTS)
 forum_write_limiter = SlidingWindowLimiter(FORUM_WRITE_WINDOW_SECONDS, FORUM_WRITE_MAX)
 search_rate_limiter = SlidingWindowLimiter(SEARCH_RATE_WINDOW_SECONDS, SEARCH_RATE_MAX)
+# Proof-of-work challenge store for register / login / rate_user.
+challenges = ChallengeManager(POW_DIFFICULTY, POW_CHALLENGE_TTL_SECONDS, POW_MAX_CHALLENGES)
 
 
 # =========================
@@ -1710,6 +1808,7 @@ def parse_bool_field(value: Any, field_name: str) -> tuple[Optional[bool], Optio
 
 VALID_ACTIONS = {
     "ping",
+    "get_challenge",
     "register",
     "login",
     "logout",
@@ -1767,6 +1866,21 @@ def require_session(request: dict[str, Any]) -> tuple[Optional[Session], Optiona
     return session, None
 
 
+def require_pow(request: dict[str, Any], purpose: str) -> Optional[dict[str, Any]]:
+    """Verify and consume a proof-of-work solution for a protected action.
+    Returns an error response dict on failure, or None to proceed. On success
+    the challenge is consumed (one-time), so each protected action requires a
+    freshly solved challenge."""
+    challenge_id = request.get("challenge_id")
+    nonce = request.get("nonce")
+    if not challenge_id or nonce is None:
+        return err("Proof-of-work required. Call get_challenge and submit challenge_id and nonce.", "challenge_failed")
+    accepted, message = challenges.consume(str(challenge_id), str(nonce), purpose)
+    if not accepted:
+        return err(message, "challenge_failed")
+    return None
+
+
 def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
     shape_problem = ensure_request_shape(request)
     if shape_problem:
@@ -1785,6 +1899,12 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         audit_log(event="request", action=action, ip=ip, status="success")
         return ok({"server": "AFTERLIFE", "version": 1}, "Welcome to AFTERLIFE")
 
+    if action == "get_challenge":
+        purpose = str(request.get("purpose", ""))
+        if purpose not in POW_PURPOSES:
+            return err("Invalid challenge purpose.", "validation_error")
+        return ok(challenges.issue(purpose), "Solve the proof-of-work challenge.")
+
     if action == "register":
         nickname = str(request.get("nickname", "")).strip()
         password = str(request.get("password", ""))
@@ -1792,6 +1912,10 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         if problem:
             audit_log(event="user_register", action=action, ip=ip, actor_nickname=nickname or None, status="fail", details=problem)
             return err(problem, "validation_error")
+        pow_failure = require_pow(request, "register")
+        if pow_failure:
+            audit_log(event="user_register", action=action, ip=ip, actor_nickname=nickname or None, status="fail", details="pow_failed")
+            return pow_failure
         success, message = get_db().create_user(nickname, password)
         audit_log(event="user_register", action=action, ip=ip, actor_nickname=nickname or None, status="success" if success else "fail", details=message)
         return ok(message=message) if success else err(message, "register_failed")
@@ -1810,6 +1934,12 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
             login_throttle.fail(ip, nickname)
             audit_log(event="login_failed", action=action, ip=ip, actor_nickname=nickname or None, status="fail", details="invalid credentials")
             return err("Invalid credentials.", "login_failed")
+        # Proof-of-work is required on every login attempt (consumed whether or
+        # not the credentials are correct), to slow credential-stuffing bots.
+        pow_failure = require_pow(request, "login")
+        if pow_failure:
+            audit_log(event="login_failed", action=action, ip=ip, actor_nickname=nickname or None, status="fail", details="pow_failed")
+            return pow_failure
         user = get_db().authenticate(nickname, password)
         if not user:
             login_throttle.fail(ip, nickname)
@@ -1977,6 +2107,10 @@ def handle_request(request: dict[str, Any], ip: str) -> dict[str, Any]:
         problem = validate_nickname(nickname) or validate_rating_choice(rating)
         if problem:
             return err(problem, "validation_error")
+        pow_failure = require_pow(request, "rate_user")
+        if pow_failure:
+            audit_log(event="user_rate", action=action, ip=ip, actor_nickname=session.nickname, target_user=nickname, status="fail", details="pow_failed")
+            return pow_failure
         success, message, target_id = get_db().set_user_rating(session.user_id, nickname, rating)
         audit_log(event="user_rate", action=action, ip=ip, actor_nickname=session.nickname, target_user=nickname, status="success" if success else "fail", details=message)
         if success and rating == "negative" and target_id is not None:

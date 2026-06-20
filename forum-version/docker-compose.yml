@@ -23,6 +23,7 @@ services:
       AFTERLIFE_MASTER_KEY_PATH: ${AFTERLIFE_MASTER_KEY_PATH:-/app/data/master.key}
       AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
       AFTERLIFE_PORT: ${AFTERLIFE_PORT:-2077}
+      AFTERLIFE_POW_DIFFICULTY: ${AFTERLIFE_POW_DIFFICULTY:-20}
 
     # Note: no-new-privileges:true was removed. On some VPS Docker configurations
     # this flag prevents root inside the container from managing volume-mounted
