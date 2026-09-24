@@ -1,0 +1,45 @@
+services:
+  afterlife-server:
+    build: .
+    container_name: afterlife-server
+    restart: unless-stopped
+
+    # No ports: section. The service is only reachable via the Tor hidden
+    # service. Exposing a port here would defeat the purpose.
+
+    volumes:
+      # The :Z suffix makes Docker relabel these bind mounts for SELinux
+      # (container_file_t, private to this container). Without it, on
+      # SELinux-enforcing hosts (Fedora/RHEL/CentOS) the container — even as
+      # root — is denied read/chown/chmod on the mounts, so Tor fails with
+      # "Directory /var/lib/tor/afterlife_hs cannot be read: Permission denied"
+      # despite correct ownership. Harmless on non-SELinux hosts (Docker
+      # ignores the suffix).
+      # Application data: database, master key, server log.
+      - ./data:/app/data:Z
+      # Tor hidden service keys. Preserves the .onion address across rebuilds.
+      - ./tor-hs:/var/lib/tor/afterlife_hs:Z
+      # Tor data directory: consensus, cached descriptors, state.
+      # Persisting this avoids a cold bootstrap on every restart.
+      - ./tor-data:/var/lib/tor/data:Z
+
+    environment:
+      AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
+      AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD}
+      AFTERLIFE_DB_PATH: ${AFTERLIFE_DB_PATH:-/app/data/AFTERLIFE.db}
+      AFTERLIFE_MASTER_KEY_PATH: ${AFTERLIFE_MASTER_KEY_PATH:-/app/data/master.key}
+      AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
+      AFTERLIFE_PORT: ${AFTERLIFE_PORT:-2077}
+      # Memory-hard PoW: base difficulty (adaptive per reputation) and scrypt cost.
+      AFTERLIFE_POW_DIFFICULTY: ${AFTERLIFE_POW_DIFFICULTY:-5}
+      AFTERLIFE_POW_SCRYPT_N: ${AFTERLIFE_POW_SCRYPT_N:-8192}
+      AFTERLIFE_POW_SCRYPT_R: ${AFTERLIFE_POW_SCRYPT_R:-8}
+      AFTERLIFE_POW_MAX_DIFFICULTY: ${AFTERLIFE_POW_MAX_DIFFICULTY:-22}
+      AFTERLIFE_POW_WRITE_EXEMPT_REP: ${AFTERLIFE_POW_WRITE_EXEMPT_REP:-5}
+      # Registration throttle + new-account read-only window.
+      AFTERLIFE_REG_MAX_PER_HOUR: ${AFTERLIFE_REG_MAX_PER_HOUR:-20}
+      AFTERLIFE_READONLY_WINDOW: ${AFTERLIFE_READONLY_WINDOW:-86400}
+
+    # Note: no-new-privileges:true was removed. On some VPS Docker configurations
+    # this flag prevents root inside the container from managing volume-mounted
+    # directories, causing the entrypoint to fail silently before any log output.
