@@ -1,0 +1,34 @@
+# AFTERLIFE onion service. This tor instance serves the onion only.
+SocksPort 0
+DataDirectory /var/lib/tor/data
+Log notice stdout
+# Never write anything identifying to disk beyond what tor needs.
+SafeLogging 1
+
+HiddenServiceDir /var/lib/tor/hs
+# The app has NO network; tor reaches it over a unix socket in a volume shared
+# only between the two containers.
+HiddenServicePort 2077 unix:/run/afterlife/app.sock
+# Prefix every stream with a PROXY v1 header carrying the circuit's global id,
+# so the app can rate-limit per Tor circuit instead of treating every client as
+# the same address.
+HiddenServiceExportCircuitID haproxy
+# One request per stream; a circuit opening many parallel streams is abusive.
+HiddenServiceMaxStreams 20
+HiddenServiceMaxStreamsCloseCircuit 1
+
+# --- network-layer denial-of-service defenses (tor >= 0.4.8 with the pow module;
+#     the container entrypoint refuses to start without it) ---
+HiddenServicePoWDefensesEnabled 1
+HiddenServicePoWQueueRate 250
+HiddenServicePoWQueueBurst 2500
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServiceEnableIntroDoSRatePerSec 25
+HiddenServiceEnableIntroDoSBurstPerSec 200
+
+# Control socket for the vanguards add-on (guard-discovery protection). It is a
+# unix socket in a 0700 directory inside this container's private tmpfs (created
+# by the entrypoint), never a TCP port.
+ControlSocket /tmp/torctl/control
+CookieAuthentication 1
+CookieAuthFile /tmp/torctl/control.authcookie

@@ -1,0 +1,1 @@
+"""AFTERLIFE server package."""
