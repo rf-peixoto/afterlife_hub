@@ -12,6 +12,9 @@ sys.path.insert(0, "/opt/vanguards")   # hash-verified vanguards + stem (see Doc
 
 if not hasattr(configparser, "SafeConfigParser"):
     configparser.SafeConfigParser = configparser.ConfigParser  # type: ignore[attr-defined]
+# readfp() was also removed in Python 3.12; vanguards uses it to load --config.
+if not hasattr(configparser.RawConfigParser, "readfp"):
+    configparser.RawConfigParser.readfp = configparser.RawConfigParser.read_file  # type: ignore[attr-defined]
 
 from vanguards.main import main  # noqa: E402
 

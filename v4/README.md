@@ -208,6 +208,24 @@ python3 client.py --host <address>.onion
   the server) is trying to intercept.
 * Changing your password (`profile → password`) re-encrypts the key file.
 
+### Troubleshooting "host unreachable"
+
+If the client works on the server machine but not on another one, the cause is
+almost always on the other machine:
+
+1. **Clock.** Run `date -u` and compare it with the real UTC time. Onion lookups
+   depend on the time, and being off by about an hour (a wrong timezone setting,
+   for example) is enough to make every onion service "unreachable". Enable NTP
+   (`timedatectl set-ntp true`).
+2. **Tor fully started.** The Tor log must show `Bootstrapped 100%`. Censored
+   networks need bridges.
+3. **Ask Tor for the exact reason.** Add `SocksPort 9050 ExtendedErrors` to that
+   machine's torrc and restart Tor. The client then prints the precise cause:
+   descriptor not found, introduction failed, and so on.
+4. **Check without the client.** In Tor Browser, open `http://<address>.onion:2077/`.
+   If the page shows `{"ok":false,...,"message":"Invalid JSON."}`, the service
+   is reachable; that response is the server rejecting a browser request.
+
 ---
 
 ## How the platform works

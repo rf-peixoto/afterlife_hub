@@ -58,9 +58,10 @@ RUN mkdir -p /var/lib/tor/hs /var/lib/tor/data /run/afterlife \
     && chown 10001:10001 /run/afterlife
 
 COPY docker/tor/torrc /etc/tor/torrc
+COPY docker/tor/vanguards.conf /etc/tor/vanguards.conf
 COPY docker/tor/entrypoint.sh /usr/local/bin/tor-entrypoint
 COPY docker/tor/run-vanguards.py /usr/local/bin/run-vanguards
-RUN chmod 0755 /usr/local/bin/tor-entrypoint /usr/local/bin/run-vanguards && chmod 0644 /etc/tor/torrc \
+RUN chmod 0755 /usr/local/bin/tor-entrypoint /usr/local/bin/run-vanguards && chmod 0644 /etc/tor/torrc /etc/tor/vanguards.conf \
     && if [ "${INSTALL_VANGUARDS}" = "1" ]; then /usr/local/bin/run-vanguards --help >/dev/null; fi
 
 USER 10002:10002

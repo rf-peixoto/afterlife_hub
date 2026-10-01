@@ -52,7 +52,7 @@ log "Onion address: $(cat /var/lib/tor/hs/hostname)"
 VG_PID=""
 VG_FAILS=0
 start_vanguards() {
-    run-vanguards --control_socket /tmp/torctl/control --state /var/lib/tor/data/vanguards.state --loglevel NOTICE &
+    run-vanguards --config /etc/tor/vanguards.conf --control_socket /tmp/torctl/control --state /var/lib/tor/data/vanguards.state --loglevel NOTICE &
     VG_PID=$!
 }
 

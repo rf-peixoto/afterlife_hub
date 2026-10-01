@@ -231,6 +231,34 @@ def check_known_host(host: str, assume_yes: bool) -> bool:
 
 
 # ============================================================== transport
+_SOCKS_ERRORS = {
+    1: "general failure",
+    5: "connection refused by the service (is the server's app container running?)",
+    6: "timed out building the circuit (Tor network slow; try again)",
+    # Onion-service specific codes, sent when your torrc has "SocksPort 9050 ExtendedErrors"
+    0xF0: "the onion service's descriptor was not found. The service is offline, has not "
+          "published yet, or YOUR CLOCK IS WRONG (check: date -u)",
+    0xF1: "the service descriptor is invalid",
+    0xF2: "introduction to the service failed (the service may be overloaded or restarting)",
+    0xF3: "rendezvous with the service failed (try again)",
+    0xF4: "the service requires client authorization",
+    0xF5: "client authorization was rejected",
+    0xF6: "invalid onion address",
+    0xF7: "introduction timed out (the service may be under load or its Tor is restarting)",
+}
+
+
+def socks_error_text(code: int) -> str:
+    if code == 4:
+        return ("Tor could not reach the onion service (host unreachable). Usual causes on THIS machine:\n"
+                "  1. wrong system clock: compare `date -u` with the real UTC time; even an hour off breaks onion lookups\n"
+                "  2. Tor not fully started: its log must show 'Bootstrapped 100%' (censored networks need bridges)\n"
+                "  3. the service is offline or still publishing (new or restarted services can take a few minutes)\n"
+                "  For the exact reason, add 'SocksPort 9050 ExtendedErrors' to your torrc and restart Tor.")
+    return f"Tor could not reach the service: {_SOCKS_ERRORS.get(code, f'SOCKS error {code}')}"
+
+
+
 @dataclass
 class Transport:
     host: str
@@ -256,9 +284,7 @@ class Transport:
             sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + struct.pack(">H", self.port))
             head = self._recv_exact(sock, 4)
             if head[1] != 0:
-                reasons = {1: "general failure", 4: "host unreachable (service offline or wrong address)",
-                           5: "connection refused", 6: "TTL expired (circuit timeout)"}
-                raise ClientError(f"Tor could not reach the service: {reasons.get(head[1], f'error {head[1]}')}")
+                raise ClientError(socks_error_text(head[1]))
             atyp = head[3]
             skip = {1: 4, 4: 16}.get(atyp)
             if skip is None:

@@ -783,6 +783,85 @@ def tx_proxy_parser_matches_tor_format():
             pass
 
 
+@test
+def tk_key_export_import_and_local_peer_keys():
+    import tempfile
+    home = Path(tempfile.mkdtemp())
+    cl.HOME = home
+    ring = cl.KeyRing(cl.KeyRing.path_for("x.onion", "amy"), [])
+    k1, k2 = ring.add_new_key(), ring.add_new_key()
+    ring.save("account password 1")
+    exp = home / "export.json"
+    ring.export_to(exp, "export passphrase")
+    assert k1["priv"] not in exp.read_text() and stat.S_IMODE(exp.stat().st_mode) == 0o600
+    # second device: has its own key, imports the old ones; its own key stays current
+    other = cl.KeyRing(cl.KeyRing.path_for("x.onion", "amy2"), [])
+    own = other.add_new_key()
+    assert other.import_from(exp, "export passphrase") == 2
+    assert other.current["fp"] == own["fp"] and other.private_for(k1["fp"]) and other.private_for(k2["fp"])
+    assert other.import_from(exp, "export passphrase") == 0          # idempotent
+    for bad_pw in ("wrong",):
+        try:
+            other.import_from(exp, bad_pw)
+            raise AssertionError("wrong passphrase accepted")
+        except cl.ClientError:
+            pass
+    # a corrupt export (private key not matching its public key) is refused
+    import json as _j
+    blob = [dict(k1, priv=k2["priv"])]
+    bad = home / "bad.json"
+    tmp = cl.KeyRing(bad, blob)
+    tmp.export_to(bad, "export passphrase")
+    try:
+        other.import_from(bad, "export passphrase")
+        raise AssertionError("corrupt export accepted")
+    except cl.ClientError:
+        pass
+    # contacts' public keys are stored locally after the first verified fetch
+    a = Api(SRV)
+    kr = cl.KeyRing(Path("/dev/null"), [])
+    e = kr.add_new_key()
+    assert a.register("peerkey1", public_key=e["pub"])["ok"]
+    b = user(SRV, "peerkey2")
+    client = cl.RemoteClient(cl.Transport("127.0.0.1", SRV.port, direct=True))
+    client.session_token = b.token
+    client.pins = cl.PeerPins("x.onion", "peerkey2")
+    # route through a PROXY-header shim: server requires it in tests
+    client.request = lambda payload: b.rq(payload.pop("action"), **payload)
+    assert client.fetch_pubkey(e["fp"]) == base64.b64decode(e["pub"])
+    fresh = cl.RemoteClient(cl.Transport("127.0.0.1", 1, direct=True))   # unreachable server
+    fresh.pins = cl.PeerPins("x.onion", "peerkey2")
+    assert fresh.fetch_pubkey(e["fp"]) == base64.b64decode(e["pub"])      # served from local disk
+
+
+@test
+def tc_client_explains_tor_onion_errors():
+    for code, needle in ((4, "date -u"), (0xF0, "descriptor was not found"), (0xF2, "introduction")):
+        lsock = socket.socket()
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen(1)
+        port = lsock.getsockname()[1]
+
+        def serve(code=code):
+            conn, _ = lsock.accept()
+            conn.recv(3); conn.sendall(b"\x05\x02")
+            ver, ulen = conn.recv(2); conn.recv(ulen); plen = conn.recv(1)[0]; conn.recv(plen)
+            conn.sendall(b"\x01\x00")
+            head = conn.recv(5); conn.recv(head[4] + 2)
+            conn.sendall(bytes([5, code, 0, 1]) + b"\x00" * 6)
+            conn.close()
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        t = cl.Transport("duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion", 2077, "127.0.0.1", port)
+        try:
+            t.roundtrip({"action": "ping"})
+            raise AssertionError("no error")
+        except cl.ClientError as exc:
+            assert needle in str(exc), (code, str(exc))
+        th.join(5)
+        lsock.close()
+
+
 def main() -> int:
     global SRV
     only = sys.argv[1:]
