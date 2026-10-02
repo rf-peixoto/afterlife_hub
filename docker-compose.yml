@@ -1,29 +1,94 @@
+# AFTERLIFE: two containers.
+#   app  - the Python server. No network at all; listens on a unix socket.
+#   tor  - the onion service. The only container with network access, and it
+#          only makes outbound connections to the Tor network. No ports are
+#          published to the host.
+# Secrets never appear in environment variables: the bootstrap admin password is
+# a one-time file in ./secrets that the server deletes after first use.
+#
+# Works with Docker and Podman (rootful or rootless). Both containers run at the
+# same SELinux level so that, on SELinux-enforcing hosts, tor may connect to the
+# app's unix socket while the volumes stay private to these two containers.
+# The option is ignored on hosts without SELinux.
+
+x-selinux: &selinux
+  - no-new-privileges:true
+  - label=level:s0:c117,c731
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
-  afterlife-server:
-    build: .
-    container_name: afterlife-server
+  app:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim-trixie}
+    image: afterlife-app:local
+    container_name: afterlife-app
     restart: unless-stopped
-
-    # No ports: section. The service is only reachable via the Tor hidden
-    # service. Exposing a port here would defeat the purpose.
-
+    init: true
+    network_mode: none
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: *selinux
+    pids_limit: 128
+    mem_limit: 768m
     volumes:
-      # Application data: database, master key, server log.
-      - ./data:/app/data
-      # Tor hidden service keys. Preserves the .onion address across rebuilds.
-      - ./tor-hs:/var/lib/tor/afterlife_hs
-      # Tor data directory: consensus, cached descriptors, state.
-      # Persisting this avoids a cold bootstrap on every restart.
-      - ./tor-data:/var/lib/tor/data
-
+      - ./data:/app/data:Z
+      - ./secrets:/app/secrets:Z
+      - ./run:/run/afterlife:Z
     environment:
-      AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME}
-      AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD: ${AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD}
-      AFTERLIFE_DB_PATH: ${AFTERLIFE_DB_PATH:-/app/data/AFTERLIFE.db}
-      AFTERLIFE_MASTER_KEY_PATH: ${AFTERLIFE_MASTER_KEY_PATH:-/app/data/master.key}
-      AFTERLIFE_LOG_PATH: ${AFTERLIFE_LOG_PATH:-/app/data/server.log}
-      AFTERLIFE_PORT: ${AFTERLIFE_PORT:-2077}
+      AFTERLIFE_UNIX_SOCKET: /run/afterlife/app.sock
+      AFTERLIFE_REQUIRE_PROXY_HEADER: "1"
+      AFTERLIFE_DB_PATH: /app/data/AFTERLIFE.db
+      AFTERLIFE_LOG_PATH: /app/data/server.log
+      AFTERLIFE_MASTER_KEY_PATH: /app/secrets/master.key
+      AFTERLIFE_BOOTSTRAP_PASSWORD_FILE: /app/secrets/bootstrap_admin_password
+      AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME: ${AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME:-}
+      AFTERLIFE_POW_DIFFICULTY: ${AFTERLIFE_POW_DIFFICULTY:-5}
+      AFTERLIFE_POW_SCRYPT_N: ${AFTERLIFE_POW_SCRYPT_N:-8192}
+      AFTERLIFE_POW_SCRYPT_R: ${AFTERLIFE_POW_SCRYPT_R:-8}
+      AFTERLIFE_POW_MAX_DIFFICULTY: ${AFTERLIFE_POW_MAX_DIFFICULTY:-20}
+      AFTERLIFE_POW_WRITE_EXEMPT_REP: ${AFTERLIFE_POW_WRITE_EXEMPT_REP:-5}
+      AFTERLIFE_REG_MAX_PER_HOUR: ${AFTERLIFE_REG_MAX_PER_HOUR:-20}
+      AFTERLIFE_READONLY_WINDOW: ${AFTERLIFE_READONLY_WINDOW:-86400}
+      AFTERLIFE_LOG_PRIVACY: ${AFTERLIFE_LOG_PRIVACY:-1}
+    logging: *logging
 
-    # Note: no-new-privileges:true was removed. On some VPS Docker configurations
-    # this flag prevents root inside the container from managing volume-mounted
-    # directories, causing the entrypoint to fail silently before any log output.
+  tor:
+    build:
+      context: .
+      dockerfile: docker/tor/Dockerfile
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE:-debian:trixie-slim}
+        INSTALL_VANGUARDS: ${INSTALL_VANGUARDS:-1}
+    image: afterlife-tor:local
+    container_name: afterlife-tor
+    restart: unless-stopped
+    init: false            # tini is PID 1 inside the image
+    depends_on:
+      - app                # the app creates the socket first
+    user: "10002:10002"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777       # the entrypoint makes a private 0700 control dir in here
+    cap_drop: [ALL]
+    security_opt: *selinux
+    pids_limit: 64
+    mem_limit: 768m
+    volumes:
+      - ./tor-hs:/var/lib/tor/hs:Z
+      - ./tor-data:/var/lib/tor/data:Z
+      - ./run:/run/afterlife:ro,Z
+    environment:
+      AFTERLIFE_VANGUARDS: ${AFTERLIFE_VANGUARDS:-1}
+      AFTERLIFE_ALLOW_NO_TOR_POW: ${AFTERLIFE_ALLOW_NO_TOR_POW:-0}
+    logging: *logging

@@ -1,278 +1,223 @@
 #!/usr/bin/env bash
+# AFTERLIFE deployment helper. Run on the server from the project directory.
+#   ./setup.sh                 first install (or rebuild/upgrade an existing one)
+#   ./setup.sh --update-images re-pin the base images to their latest digests
+#
+# Works with Docker or Podman, rootful or rootless. Ownership of the data
+# directories is set from INSIDE a helper container, so the uids always match
+# what the real containers see (rootless engines remap uids on the host).
 set -euo pipefail
+umask 077
 
-DATA_DIR="./data"
-TOR_HS_DIR="./tor-hs"
-TOR_DATA_DIR="./tor-data"
+APP_UID=10001
+TOR_UID=10002
 ENV_FILE="./.env"
-DEFAULT_CONTAINER_NAME="afterlife-server"
-STARTUP_WAIT_SECONDS=120
-HEALTHCHECK_LOG_TAIL=80
+MARKER="./.afterlife-installed"
+APP_IMAGE="afterlife-app:local"
+DEFAULT_POW_DIFFICULTY=5
+PYTHON_TAG="python:3.12-slim-trixie"
+DEBIAN_TAG="debian:trixie-slim"
+WAIT_SECONDS=240
+UPDATE_IMAGES=0
+[[ "${1:-}" == "--update-images" ]] && UPDATE_IMAGES=1
 
-GREEN="\033[1;32m"
-RED="\033[1;31m"
-CYAN="\033[1;36m"
-YELLOW="\033[1;33m"
-RESET="\033[0m"
-
-ADMIN_USER=""
-ADMIN_PASS=""
-CONTAINER_NAME="${DEFAULT_CONTAINER_NAME}"
-
-banner() {
-    echo -e "${CYAN}========================================${RESET}"
-    echo -e "${CYAN}     AFTERLIFE TOR DEPLOYMENT${RESET}"
-    echo -e "${CYAN}========================================${RESET}"
-}
-
+GREEN="\033[1;32m"; RED="\033[1;31m"; CYAN="\033[1;36m"; YELLOW="\033[1;33m"; RESET="\033[0m"
 info()    { echo -e "${YELLOW}[+] $*${RESET}"; }
 success() { echo -e "${GREEN}[OK] $*${RESET}"; }
 warn()    { echo -e "${YELLOW}[WARN] $*${RESET}"; }
 fail()    { echo -e "${RED}[ERROR] $*${RESET}" >&2; exit 1; }
 
-compose_cmd() {
-    if docker compose version >/dev/null 2>&1; then
-        echo "docker compose"; return
-    fi
-    if command -v docker-compose >/dev/null 2>&1; then
-        echo "docker-compose"; return
-    fi
-    fail "docker compose was not found."
-}
+compose() { docker compose --env-file "$ENV_FILE" "$@"; }
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
+# Run a command as root inside a throw-away container that has the given
+# project directories mounted. SELinux labelling is disabled for this helper
+# only, so it never relabels files away from the running service.
+helper() {
+    local mounts=() d
+    for d in data secrets tor-hs tor-data run; do mounts+=(-v "$PWD/$d:/w/$d"); done
+    docker run --rm -i --user 0 --network none --security-opt label=disable \
+        "${mounts[@]}" --entrypoint /bin/sh "$APP_IMAGE" -c "$1"
+}
 
 check_dependencies() {
-    require_cmd docker
-    require_cmd sudo
-    require_cmd awk
-    require_cmd grep
-    require_cmd sleep
-    require_cmd chmod
-    require_cmd chown
-    require_cmd mkdir
-}
-
-validate_admin_user() {
-    [[ "$1" =~ ^[A-Za-z0-9_]{3,12}$ ]] || fail "Admin username must be 3-12 chars, letters/digits/underscore only."
-}
-
-validate_password() {
-    local pass="$1"
-    [[ -n "$pass" ]]          || fail "Admin password cannot be empty."
-    (( ${#pass} >= 12 ))      || fail "Admin password must be at least 12 characters."
-    [[ "$pass" != *$'\n'* ]]  || fail "Admin password cannot contain newline characters."
-    [[ "$pass" != *$'\r'* ]]  || fail "Admin password cannot contain carriage return characters."
-}
-
-prompt_inputs() {
-    echo -e "${CYAN}This will bootstrap AFTERLIFE as a Tor hidden service.${RESET}"
-    echo -e "${CYAN}The server will NOT be reachable via a raw IP address.${RESET}"
-    echo
-
-    read -rp  "Admin username (3-12 chars): " ADMIN_USER
-    validate_admin_user "$ADMIN_USER"
-
-    read -rsp "Admin password (min 12 chars): " ADMIN_PASS
-    echo
-    validate_password "$ADMIN_PASS"
-
-    read -rp  "Docker container name [${DEFAULT_CONTAINER_NAME}]: " CONTAINER_NAME
-    CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
-}
-
-prepare_folders() {
-    info "Preparing folder structure..."
-    sudo mkdir -p "$DATA_DIR" "$TOR_HS_DIR" "$TOR_DATA_DIR"
-    sudo chmod 700 "$DATA_DIR"
-    # tor-hs and tor-data start as root:root. We fix ownership after the
-    # image is built, once we know debian-tor's actual UID inside the container.
-    sudo chmod 755 "$TOR_HS_DIR"
-    sudo chmod 755 "$TOR_DATA_DIR"
-}
-
-write_env() {
-    info "Writing ${ENV_FILE} ..."
-    : > "$ENV_FILE"
-    {
-        printf 'AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME=%s\n' "$ADMIN_USER"
-        printf 'AFTERLIFE_BOOTSTRAP_ADMIN_PASSWORD=%s\n' "$ADMIN_PASS"
-        printf 'AFTERLIFE_DB_PATH=%s\n'         '/app/data/AFTERLIFE.db'
-        printf 'AFTERLIFE_MASTER_KEY_PATH=%s\n' '/app/data/master.key'
-        printf 'AFTERLIFE_LOG_PATH=%s\n'        '/app/data/server.log'
-        printf 'AFTERLIFE_PORT=%s\n'            '2077'
-    } > "$ENV_FILE"
-    chmod 600 "$ENV_FILE" || true
-}
-
-apply_permissions() {
-    info "Applying data directory permissions..."
-    sudo chmod 700 "$DATA_DIR"
-    [[ -f "${DATA_DIR}/master.key" ]]   && sudo chmod 600 "${DATA_DIR}/master.key"   || true
-    [[ -f "${DATA_DIR}/server.log" ]]   && sudo chmod 644 "${DATA_DIR}/server.log"   || true
-    [[ -f "${DATA_DIR}/AFTERLIFE.db" ]] && sudo chmod 600 "${DATA_DIR}/AFTERLIFE.db" || true
-}
-
-build_image() {
-    local compose
-    compose="$(compose_cmd)"
-    info "Building Docker image..."
-    $compose --env-file "$ENV_FILE" build
-}
-
-fix_tor_directory_ownership() {
-    # Tor requires HiddenServiceDir to be owned by the tor user (debian-tor)
-    # and mode 700. On some Docker configurations (user namespace remapping),
-    # root inside the container cannot chown volume-mounted host directories.
-    # We solve this on the HOST: query debian-tor's UID from the built image,
-    # then chown the directories before the container starts.
-    local compose
-    compose="$(compose_cmd)"
-
-    info "Querying debian-tor UID from built image..."
-    local deb_tor_uid deb_tor_gid
-    deb_tor_uid="$($compose --env-file "$ENV_FILE" run \
-        --rm --no-deps --entrypoint "" \
-        afterlife-server \
-        id -u debian-tor 2>/dev/null || echo "")"
-    deb_tor_gid="$($compose --env-file "$ENV_FILE" run \
-        --rm --no-deps --entrypoint "" \
-        afterlife-server \
-        id -g debian-tor 2>/dev/null || echo "")"
-
-    if [[ "$deb_tor_uid" =~ ^[0-9]+$ && "$deb_tor_gid" =~ ^[0-9]+$ ]]; then
-        info "Setting tor directory ownership to debian-tor (UID ${deb_tor_uid} GID ${deb_tor_gid})..."
-        sudo chown "${deb_tor_uid}:${deb_tor_gid}" "$TOR_HS_DIR"
-        sudo chmod 700 "$TOR_HS_DIR"
-        sudo chown "${deb_tor_uid}:${deb_tor_gid}" "$TOR_DATA_DIR"
-        sudo chmod 700 "$TOR_DATA_DIR"
+    command -v docker >/dev/null 2>&1 || fail "docker (or podman with the docker CLI shim) is not installed."
+    docker compose version >/dev/null 2>&1 || fail "A compose provider is required (docker compose v2, or podman with docker-compose/podman-compose)."
+    [[ -f docker-compose.yml && -f server.py ]] || fail "Run this script from the AFTERLIFE project directory."
+    if docker --version 2>/dev/null | grep -qi podman; then
+        info "Container engine: Podman"
     else
-        warn "Could not determine debian-tor UID. Falling back to UID 107 (Debian default)."
-        sudo chown "107:107" "$TOR_HS_DIR"
-        sudo chmod 700 "$TOR_HS_DIR"
-        sudo chown "107:107" "$TOR_DATA_DIR"
-        sudo chmod 700 "$TOR_DATA_DIR"
+        info "Container engine: Docker"
     fi
 }
 
-start_stack() {
-    local compose
-    compose="$(compose_cmd)"
-    info "Starting Docker stack..."
-    $compose --env-file "$ENV_FILE" down >/dev/null 2>&1 || true
-    $compose --env-file "$ENV_FILE" up -d
+# ---------------------------------------------------------------- .env (no secrets in it)
+env_get() {
+    if [[ -f "$ENV_FILE" ]]; then
+        { grep -E "^$1=" "$ENV_FILE" || true; } | tail -1 | cut -d= -f2- | sed -e "s/^'//" -e "s/'$//"
+    fi
 }
 
-container_exists() {
-    docker inspect "$CONTAINER_NAME" >/dev/null 2>&1
+env_set() {
+    local key="$1" value="$2" tmp
+    [[ "$value" =~ ^[A-Za-z0-9_.:@/+-]*$ ]] || fail "Refusing to write unsafe value for $key."
+    tmp="$(mktemp)"
+    if [[ -f "$ENV_FILE" ]]; then grep -vE "^$key=" "$ENV_FILE" > "$tmp" || true; fi
+    printf "%s='%s'\n" "$key" "$value" >> "$tmp"   # single quotes: compose never interpolates them
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
-logs_show_listening() {
-    docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>&1 \
-        | grep -q "server_listening"
+# ---------------------------------------------------------------- prompts
+ADMIN_USER=""
+ADMIN_PASS=""
+
+prompt_admin() {
+    local pass2
+    read -rp "Admin username (3-12 chars): " ADMIN_USER
+    [[ "$ADMIN_USER" =~ ^[A-Za-z0-9_]{3,12}$ ]] || fail "Admin username must be 3-12 chars: letters, digits, underscore."
+    read -rsp "Admin password (12-128 chars): " ADMIN_PASS; echo
+    read -rsp "Repeat admin password: " pass2; echo
+    [[ "$ADMIN_PASS" == "$pass2" ]] || fail "Passwords do not match."
+    (( ${#ADMIN_PASS} >= 12 && ${#ADMIN_PASS} <= 128 )) || fail "Admin password must be 12-128 characters."
+    [[ "$ADMIN_PASS" != *[$'\n\r\t']* ]] || fail "Admin password cannot contain newlines or tabs."
 }
 
-logs_show_permission_error() {
-    docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>&1 \
-        | grep -q "Permission denied"
+prompt_pow() {
+    local d
+    echo
+    echo -e "${CYAN}Anti-bot proof-of-work BASE difficulty${RESET} (scrypt, ~20 ms per guess; each bit doubles the work)"
+    echo "  1-3 light | 4-6 moderate (recommended) | 7-9 strong | 10+ heavy"
+    read -rp "Base difficulty [${DEFAULT_POW_DIFFICULTY}]: " d
+    d="${d:-$DEFAULT_POW_DIFFICULTY}"
+    if ! [[ "$d" =~ ^[0-9]+$ ]] || (( d < 1 || d > 20 )); then fail "Difficulty must be a whole number from 1 to 20."; fi
+    env_set AFTERLIFE_POW_DIFFICULTY "$d"
 }
 
-wait_for_onion_address() {
-    info "Waiting for Tor hidden service to start (up to ${STARTUP_WAIT_SECONDS}s)..."
-    local elapsed=0
-    while (( elapsed < STARTUP_WAIT_SECONDS )); do
-        local addr
-        addr="$(docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>&1 \
-            | grep "Onion address" \
-            | awk '{print $NF}' \
-            | tail -1)"
-        if [[ -n "$addr" ]]; then
-            echo "$addr"
-            return 0
-        fi
-        sleep 1
-        (( elapsed++ ))
+# ---------------------------------------------------------------- images
+pin_images() {
+    if [[ -n "$(env_get PYTHON_IMAGE)" && -n "$(env_get DEBIAN_IMAGE)" && $UPDATE_IMAGES -eq 0 ]]; then
+        info "Using pinned base images from .env (run with --update-images to refresh)."
+        return
+    fi
+    info "Pulling and pinning base images by digest..."
+    local tag digest
+    for tag in "$PYTHON_TAG" "$DEBIAN_TAG"; do
+        docker pull -q "$tag" >/dev/null
+        digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$tag")"
+        [[ "$digest" == *@sha256:* ]] || fail "Could not determine digest for $tag."
+        if [[ "$tag" == python:* ]]; then env_set PYTHON_IMAGE "$digest"; else env_set DEBIAN_IMAGE "$digest"; fi
+        success "$tag -> $digest"
     done
-    return 1
 }
 
-show_diagnostics() {
-    echo
-    info "Diagnostics"
-    echo "Container : ${CONTAINER_NAME}"
-    echo "Data dir  : $(realpath "$DATA_DIR" 2>/dev/null || echo "$DATA_DIR")"
-    echo "HS dir    : $(realpath "$TOR_HS_DIR" 2>/dev/null || echo "$TOR_HS_DIR")"
-    echo "Tor data  : $(realpath "$TOR_DATA_DIR" 2>/dev/null || echo "$TOR_DATA_DIR")"
-    echo
-    echo "Host permissions:"
-    ls -ld "$DATA_DIR" "$TOR_HS_DIR" "$TOR_DATA_DIR" || true
-    echo
-    echo "Recent docker logs:"
-    docker logs --tail "${HEALTHCHECK_LOG_TAIL}" "$CONTAINER_NAME" 2>/dev/null || true
-    echo
+build_images() {
+    if [[ "${AFTERLIFE_SETUP_SKIP_BUILD:-0}" == "1" ]]; then return; fi
+    info "Building images (tor from deb.torproject.org, verified by key fingerprint)..."
+    compose build
 }
 
-show_summary() {
-    local onion_addr="$1"
-    echo -e "${GREEN}========================================${RESET}"
-    echo -e "${GREEN}AFTERLIFE DEPLOYMENT COMPLETE${RESET}"
-    echo -e "${GREEN}========================================${RESET}"
-    echo "Admin username  : ${ADMIN_USER}"
-    echo "Container name  : ${CONTAINER_NAME}"
-    echo "Log file        : ${DATA_DIR}/server.log"
-    echo "Database        : ${DATA_DIR}/AFTERLIFE.db"
-    echo
-    echo -e "${CYAN}Onion address   : ${onion_addr}${RESET}"
-    echo
-    echo "Client command (requires proxychains + Tor):"
-    echo "  proxychains python3 client.py --host ${onion_addr} --port 2077"
-    echo
-    echo "The .onion address is stable across restarts because the keys are stored in:"
-    echo "  ${TOR_HS_DIR}/"
-    echo "Back up this directory if you want to preserve the address permanently."
-    echo
-    echo "Useful commands:"
-    echo "  docker logs -f ${CONTAINER_NAME}"
-    echo "  tail -f ${DATA_DIR}/server.log"
-    echo "  ls -l ${DATA_DIR}"
+# ---------------------------------------------------------------- filesystem (via helper container)
+prepare_folders() {
+    info "Preparing directories and ownership..."
+    mkdir -p ./data ./secrets ./tor-hs ./tor-data ./run 2>/dev/null || true
+    local script="set -e
+        chown ${APP_UID}:${APP_UID} /w/data /w/secrets /w/run
+        chown -R ${APP_UID}:${APP_UID} /w/data /w/secrets
+        chown -R ${TOR_UID}:${TOR_UID} /w/tor-hs /w/tor-data
+        chmod 700 /w/data /w/secrets /w/tor-hs /w/tor-data
+        chmod 755 /w/run"
+    if helper "$script" 2>/dev/null; then return; fi
+    # Typical cause: directories left by an older setup.sh that chowned them on the
+    # HOST to uid 10001/10002, which a rootless engine cannot map. Reclaim them for
+    # the current user once, then let the container assign the right ids.
+    warn "Could not set ownership from the container; reclaiming leftover directories (sudo)..."
+    command -v sudo >/dev/null 2>&1 || fail "Please run: chown -R $(id -u):$(id -g) data secrets tor-hs tor-data run   (as root), then re-run."
+    sudo chown -R "$(id -u):$(id -g)" ./data ./secrets ./tor-hs ./tor-data ./run
+    helper "$script" || fail "Could not set directory ownership inside the container."
+}
+
+existing_install() {
+    [[ -f "$MARKER" ]] && return 0
+    helper "test -f /w/data/AFTERLIFE.db" 2>/dev/null
+}
+
+write_bootstrap_password() {
+    # One-time secret file, read and deleted by the server on first start. It is
+    # passed through stdin (never argv), and never lands in .env, an environment
+    # variable, or an image.
+    printf '%s\n' "$ADMIN_PASS" | helper "set -e; umask 077
+        cat > /w/secrets/bootstrap_admin_password
+        chown ${APP_UID}:${APP_UID} /w/secrets/bootstrap_admin_password
+        chmod 600 /w/secrets/bootstrap_admin_password"
+    ADMIN_PASS=""
+}
+
+wait_for() {
+    local what="$1" service="$2" pattern="$3" i=0 logs
+    info "Waiting for $what (up to ${WAIT_SECONDS}s)..."
+    while (( i < WAIT_SECONDS )); do
+        logs="$(compose logs --no-color "$service" 2>/dev/null || true)"
+        if grep -q "$pattern" <<<"$logs"; then return 0; fi
+        if grep -q "FATAL" <<<"$logs"; then
+            grep -v '^$' <<<"$logs" | tail -40; fail "$service failed to start (see above)."
+        fi
+        sleep 1; i=$((i + 1))
+    done
+    compose logs --no-color --tail 60 "$service" || true
+    fail "Timed out waiting for $what."
 }
 
 main() {
-    banner
     check_dependencies
-    prompt_inputs
+    if [[ ! -f "$ENV_FILE" ]]; then : > "$ENV_FILE"; chmod 600 "$ENV_FILE"; fi
+    local fresh=1
+    if [[ -f "$MARKER" ]]; then fresh=0; fi
+    if (( fresh )); then
+        echo -e "${CYAN}This bootstraps AFTERLIFE as a Tor onion service. No port is exposed to the internet.${RESET}"
+        prompt_admin
+        prompt_pow
+    else
+        info "Existing installation detected: rebuilding/upgrading without touching accounts."
+    fi
+    [[ "${AFTERLIFE_SETUP_SKIP_BUILD:-0}" == "1" ]] || pin_images
+    build_images
     prepare_folders
-    write_env
-    apply_permissions
-    build_image
-    fix_tor_directory_ownership
-    start_stack
-
-    if ! container_exists; then
-        fail "Container '${CONTAINER_NAME}' was not created. Check docker-compose.yml."
+    if (( fresh )) && existing_install; then
+        warn "A database already exists in ./data; keeping its accounts (the admin you entered is ignored)."
+        fresh=0
     fi
-
-    sleep 3
-
-    local onion_addr
-    if ! onion_addr="$(wait_for_onion_address)"; then
-        show_diagnostics
-        fail "Timed out waiting for Tor hidden service address. Check logs above."
+    if (( fresh )); then
+        env_set AFTERLIFE_BOOTSTRAP_ADMIN_USERNAME "$ADMIN_USER"
+        write_bootstrap_password
     fi
-
-    sleep 2
-
-    if ! logs_show_listening; then
-        if logs_show_permission_error; then
-            show_diagnostics
-            fail "Container has permission errors. Check logs above."
-        fi
-        show_diagnostics
-        fail "Container did not reach listening state. Check logs above."
+    info "Starting containers..."
+    compose up -d --remove-orphans
+    wait_for "the application server" app "server_listening"
+    wait_for "the onion address" tor "Onion address:"
+    : > "$MARKER"
+    if helper "test -f /w/secrets/bootstrap_admin_password" 2>/dev/null; then
+        warn "The one-time admin password file still exists; it is deleted on the first successful start."
     fi
-
-    success "Container is up and listening."
-    show_summary "$onion_addr"
+    local onion
+    onion="$(compose logs --no-color tor 2>/dev/null | grep -o 'Onion address: [a-z2-7]\{56\}\.onion' | tail -1 | awk '{print $3}')"
+    echo
+    echo -e "${GREEN}========================================${RESET}"
+    echo -e "${GREEN}AFTERLIFE DEPLOYMENT COMPLETE${RESET}"
+    echo -e "${GREEN}========================================${RESET}"
+    echo "Admin username : ${ADMIN_USER:-<unchanged>}"
+    echo -e "${CYAN}Onion address  : ${onion}${RESET}"
+    echo
+    echo "Clients (Tor must be running locally; no proxychains needed):"
+    echo "  python3 client.py --host ${onion}"
+    echo
+    echo "Publish the address only through a channel you control and sign it"
+    echo "(e.g. a PGP/minisign-signed announcement) so users can detect fake mirrors."
+    echo
+    echo -e "${YELLOW}Back up the onion key and master key NOW, encrypted and offline:${RESET}"
+    echo "  ./backup_keys.sh"
+    echo
+    echo "Firewall (host): only SSH inbound is needed."
+    echo "Logs: docker compose logs -f app   |   docker compose logs -f tor"
 }
 
 main "$@"
